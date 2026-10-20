@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Environment / Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local output
+output/
+logs/
+*.log
+
+# OS / Editor
+.DS_Store
+.vscode/
+
+# Kubernetes local configuration
+kubeconfig

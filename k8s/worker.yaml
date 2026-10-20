@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-worker
+  namespace: ai-mobility-poc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-worker
+  template:
+    metadata:
+      labels:
+        app: inference-worker
+    spec:
+      containers:
+        - name: worker
+          image: ai-mobility-inference-poc:cpu
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -m
+            - src.worker
+          env:
+            - name: REDIS_HOST
+              value: redis
+            - name: MONGO_URI
+              value: mongodb://mongo:27017/
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+              cpu: "1"
