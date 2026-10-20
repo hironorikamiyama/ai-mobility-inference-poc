@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: benchmark-producer
+  namespace: ai-mobility-poc
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: producer
+          image: ai-mobility-inference-poc:cpu
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /app/scripts/benchmark_producer.py
+          args:
+            - --run-id
+            - perf-pipeline-manual
+            - --count
+            - "100"
+          env:
+            - name: REDIS_HOST
+              value: redis
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: benchmark-script
+              mountPath: /app/scripts
+              readOnly: true
+      volumes:
+        - name: benchmark-script
+          configMap:
+            name: benchmark-producer

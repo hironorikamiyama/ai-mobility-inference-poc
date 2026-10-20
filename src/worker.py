@@ -1,3 +1,5 @@
+"""Redis Streamsから推論ジョブを処理するWorker。"""
+
 import os
 import time
 from datetime import datetime, timezone
@@ -8,7 +10,11 @@ from redis.exceptions import ResponseError
 
 from src.database import get_collection, save_result
 from src.inference import InferenceWorker
-
+from src.performance_metrics import calculate_latencies
+from src.retry_policy import (
+    make_retry_exhausted_record,
+    should_dead_letter,
+)
 
 STREAM_NAME = "inference_jobs"
 GROUP_NAME = "inference_workers"
@@ -36,14 +42,54 @@ def validate_job(fields):
     if not job_id:
         raise ValueError("job_id is empty")
 
-    value = float(fields["input_value"])
+    input_value = float(fields["input_value"])
 
-    if not 0.0 <= value <= 1.0:
+    if not 0 <= input_value <= 1:
         raise ValueError(
             "input_value must be between 0 and 1"
         )
 
-    return job_id, value
+    return job_id, input_value
+
+
+def dead_letter_and_ack(client, message_id, record):
+    """DLQへの記録とACKをRedis内で原子的に実行する。"""
+    record = {
+        **record,
+        "failed_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    with client.pipeline(transaction=True) as pipe:
+        pipe.xadd(DEAD_LETTER_STREAM, record)
+        pipe.xack(STREAM_NAME, GROUP_NAME, message_id)
+        results = pipe.execute()
+
+    if results[1] != 1:
+        print(
+            f"Warning: ACK count={results[1]}, "
+            f"stream_id={message_id}",
+            flush=True,
+        )
+
+
+def get_delivery_count(client, message_id):
+    """Pending情報から配信回数を取得する。"""
+    entries = client.xpending_range(
+        STREAM_NAME,
+        GROUP_NAME,
+        min=message_id,
+        max=message_id,
+        count=1,
+    )
+
+    if not entries:
+        raise RuntimeError(
+            f"Pending entry not found: {message_id}"
+        )
+
+    return int(entries[0]["times_delivered"])
 
 
 def process_message(
@@ -52,28 +98,26 @@ def process_message(
     worker,
     message_id,
     fields,
+    received_at=None,
 ):
+    started_at = datetime.now(timezone.utc)
+
+    if received_at is None:
+        received_at = started_at
+
     started = time.perf_counter()
 
-    # 不正な入力は再実行しても回復しないため隔離する
     try:
         job_id, input_value = validate_job(fields)
     except (ValueError, KeyError, TypeError) as exc:
-        client.xadd(
-            DEAD_LETTER_STREAM,
+        dead_letter_and_ack(
+            client,
+            message_id,
             {
                 "original_stream_id": message_id,
                 "reason": str(exc),
                 "payload": str(fields),
-                "failed_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
             },
-        )
-        client.xack(
-            STREAM_NAME,
-            GROUP_NAME,
-            message_id,
         )
         print(
             f"Rejected: stream_id={message_id}, "
@@ -82,10 +126,10 @@ def process_message(
         )
         return
 
-    # 障害再現用。通常は0秒
     delay = float(
         os.getenv("WORKER_PROCESSING_DELAY_SECONDS", "0")
     )
+
     if delay > 0:
         time.sleep(delay)
 
@@ -96,7 +140,7 @@ def process_message(
 
     score = worker.predict(image)[0]
 
-    # 保存が成功した後でのみACKする
+    # MongoDB保存が成功した場合のみACKする
     save_result(
         collection=collection,
         job_id=job_id,
@@ -104,6 +148,27 @@ def process_message(
         score=score,
         device=worker.device.type,
     )
+
+    saved_at = datetime.now(timezone.utc)
+
+    latencies = calculate_latencies(
+        message_id=message_id,
+        started_at=started_at,
+        saved_at=saved_at,
+    )
+
+    created_at = datetime.fromtimestamp(
+        int(message_id.split("-", 1)[0]) / 1000,
+        tz=timezone.utc,
+    )
+
+    redis_wait_ms = (
+        received_at - created_at
+    ).total_seconds() * 1000
+
+    dispatch_wait_ms = (
+        started_at - received_at
+    ).total_seconds() * 1000
 
     acknowledged = client.xack(
         STREAM_NAME,
@@ -120,8 +185,54 @@ def process_message(
         f"stream_id={message_id}, "
         f"score={score:.6f}, "
         f"elapsed_ms={elapsed_ms:.2f}, "
+        f"queue_ms={latencies['queue_latency_ms']:.3f}, "
+        f"worker_ms={latencies['worker_latency_ms']:.3f}, "
+        f"e2e_ms={latencies['end_to_end_latency_ms']:.3f}, "
+        f"redis_wait_ms={redis_wait_ms:.3f}, "
+        f"dispatch_wait_ms={dispatch_wait_ms:.3f}, "
         f"ack={acknowledged}",
         flush=True,
+    )
+
+def handle_message(
+    client,
+    collection,
+    worker,
+    message_id,
+    fields,
+    received_at=None,
+):
+    """配信回数を確認して処理または隔離を行う。"""
+    delivery_count = get_delivery_count(
+        client, message_id
+    )
+
+    if should_dead_letter(delivery_count):
+        record = make_retry_exhausted_record(
+            message_id=message_id,
+            fields=fields,
+            delivery_count=delivery_count,
+        )
+
+        dead_letter_and_ack(
+            client, message_id, record
+        )
+
+        print(
+            f"Retry exhausted: "
+            f"stream_id={message_id}, "
+            f"delivery_count={delivery_count}",
+            flush=True,
+        )
+        return
+
+    process_message(
+        client,
+        collection,
+        worker,
+        message_id,
+        fields,
+        received_at=received_at,
     )
 
 
@@ -151,8 +262,6 @@ def main():
 
     while True:
         try:
-            # 停止したWorkerなどの未ACKジョブを回収
-            # 30秒以上アイドル状態のものが対象
             claimed = client.xautoclaim(
                 STREAM_NAME,
                 GROUP_NAME,
@@ -167,30 +276,39 @@ def main():
             if pending_messages:
                 messages = pending_messages
             else:
-                # 未処理の新規メッセージを取得
+                batch_size = int(
+                    os.getenv("READ_BATCH_SIZE", "10")
+                )
+                if batch_size < 1:
+                    raise ValueError(
+                        "READ_BATCH_SIZE must be >= 1"
+                    )
+
                 result = client.xreadgroup(
                     GROUP_NAME,
                     consumer,
                     {STREAM_NAME: ">"},
-                    count=10,
+                    count=batch_size,
                     block=2000,
                 )
-
                 messages = (
                     result[0][1] if result else []
                 )
 
+            received_at = datetime.now(timezone.utc)
+
             for message_id, fields in messages:
                 try:
-                    process_message(
+                    handle_message(
                         client,
                         collection,
                         worker,
                         message_id,
                         fields,
+                        received_at=received_at,
                     )
                 except Exception as exc:
-                    # ACKしない。後で再取得可能にする
+                    # ACKせずPendingに残す
                     print(
                         f"Processing failed: "
                         f"stream_id={message_id}, "
