@@ -1,3 +1,4 @@
+
 version: 2.1
 
 jobs:
@@ -14,20 +15,27 @@ jobs:
           name: Check Python version
           command: python --version
 
+      - restore_cache:
+          keys:
+            - pip-v1-py314-{{ arch }}-{{ checksum "requirements.txt" }}
+            - pip-v1-py314-{{ arch }}-
+
       - run:
           name: Install dependencies
           command: |
             python -m pip install --upgrade pip
 
-            # PyTorch CPU版を専用インデックスからインストール
             python -m pip install \
               torch==2.14.1+cpu \
               --index-url https://download.pytorch.org/whl/cpu
 
-            # その他の依存ライブラリをインストール
             python -m pip install -r requirements.txt
-
             python -m pip install pytest
+
+      - save_cache:
+          key: pip-v1-py314-{{ arch }}-{{ checksum "requirements.txt" }}
+          paths:
+            - ~/.cache/pip
 
       - run:
           name: Check Python syntax
