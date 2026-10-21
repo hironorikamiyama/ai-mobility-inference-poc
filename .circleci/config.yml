@@ -185,7 +185,7 @@ jobs:
       - run:
           name: Wait for Redis and MongoDB
           command: |
-            python - <<'PY'
+            python - \<<'PY'
             import time
             from pymongo import MongoClient
             from redis import Redis
