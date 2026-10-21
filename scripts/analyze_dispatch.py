@@ -12,6 +12,9 @@ PATTERN = re.compile(
     r"queue_ms=([-\d.]+), .*?"
     r"redis_wait_ms=([-\d.]+), "
     r"dispatch_wait_ms=([-\d.]+), "
+    r"(?:tensor_ms=[-\d.]+, "
+    r"inference_ms=[-\d.]+, "
+    r"mongo_save_ms=[-\d.]+, )?"
     r"ack=1"
 )
 

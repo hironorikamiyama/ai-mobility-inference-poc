@@ -3,9 +3,9 @@
 
 Redis Streams、Python / PyTorch、MongoDBを組み合わせた**非同期推論処理基盤の最小構成PoC**です。
 
-Docker Composeで基本動作を確認した後、ローカルKubernetes（kind）へ移行し、ジョブ投入から推論結果の保存、障害発生時の再処理、性能計測までを検証しました。
+Docker Composeで基本動作を確認した後、ローカルKubernetes（kind）へ移行し、ジョブ投入、推論結果の保存、障害発生時の再処理、Workerの並列化、性能計測までを検証しました。
 
-本PoCでは、推論モデルの高度化よりも、**非同期処理基盤の信頼性、データ整合性、障害回復、性能評価**に重点を置いています。
+本PoCでは、推論モデルの高度化よりも、**非同期処理基盤の信頼性、データ整合性、障害回復、性能評価、可観測性**に重点を置いています。
 
 > **位置づけ**
 >
@@ -14,73 +14,90 @@ Docker Composeで基本動作を確認した後、ローカルKubernetes（kind�
 > 実際のVPS（Visual Positioning System）、マルチモーダルモデル、車載システムを実装したものではありません。
 >
 > 推論処理には疑似画像の平均値計算を使用しています。
+>
+> 性能測定結果はローカル検証環境における参考値であり、本番環境の性能を保証するものではありません。
 
 ## 1. システム構成
 
 ```mermaid
 flowchart TD
-    P[Producer<br/>Python / Kubernetes Job]
-    R[(Redis Streams<br/>inference_jobs)]
-    W[Inference Worker<br/>Python / PyTorch CPU]
-    M[(MongoDB<br/>inference_results)]
-    D[(Dead Letter Stream<br/>inference_jobs_dead)]
+    P[Producer / Python]
+    R[(Redis Streams)]
+    W1[Inference Worker 1]
+    W2[Inference Worker 2]
+    M[(MongoDB)]
+    D[(Dead Letter Stream)]
 
     P -->|XADD| R
-    R -->|XREADGROUP| W
-    R -->|XAUTOCLAIM| W
-    W -->|推論結果をupsert| M
-    W -->|保存成功後 XACK| R
-    W -->|不正入力・再試行上限超過| D
+    R -->|XREADGROUP| W1
+    R -->|XREADGROUP| W2
+    R -->|XAUTOCLAIM| W1
+    R -->|XAUTOCLAIM| W2
+    W1 -->|upsert| M
+    W2 -->|upsert| M
+    W1 -->|保存成功後 XACK| R
+    W2 -->|保存成功後 XACK| R
+    W1 -->|再試行上限超過| D
+    W2 -->|再試行上限超過| D
 ```
+
+Worker 2台は並列処理構成を表しています。通常の動作確認では1台構成も使用します。
 
 | コンポーネント | 役割 | 主な実装 |
 | --- | --- | --- |
 | Producer | 疑似推論ジョブの生成・投入 | `src/producer.py` |
-| Redis Streams | 非同期ジョブキュー・Consumer Group | `inference_jobs` |
+| Redis Streams | 非同期ジョブキュー | `inference_jobs` |
+| Consumer Group | 複数Workerへのジョブ配信 | `inference_workers` |
 | Worker | ジョブ取得・検証・推論・保存・ACK | `src/worker.py` |
-| 推論ロジック | 疑似画像テンソルの平均値計算 | `src/inference.py` |
-| デバイス選択 | CPU / GPUデバイスの選択 | `src/device.py` |
-| MongoDB | `job_id` 単位で推論結果を保存 | `src/database.py` |
-| 再試行制御 | 配信回数の評価・DLQ隔離判定 | `src/retry_policy.py` |
-| 性能指標 | Queue / Worker / E2Eの時間計算 | `src/performance_metrics.py` |
-| Docker Compose | ローカルでのサービス実行 | `compose.yaml` |
-| Kubernetes | Redis / MongoDB / Worker / Producer Job | `k8s/` |
+| 推論ロジック | 疑似画像の平均値計算 | `src/inference.py` |
+| デバイス選択 | CPU / GPUデバイス選択 | `src/device.py` |
+| MongoDB | 推論結果の保存 | `src/database.py` |
+| 再試行制御 | 配信回数・DLQ判定 | `src/retry_policy.py` |
+| 性能指標 | Queue / Worker / E2E計算 | `src/performance_metrics.py` |
+| Docker Compose | ローカルサービス実行 | `compose.yaml` |
+| Kubernetes | Redis / MongoDB / Worker / Producer | `k8s/` |
+| ベンチマーク | 100件投入・分析・結果保存 | `scripts/` |
 
-### 1.1 推論モデルについて
+### 1.1 推論モデル
 
 入力値 `input_value` から単一チャネルの16×16疑似画像を生成し、全画素の平均値をスコアとして返します。
-
-例えば、入力値が `0.5` の場合、概ね `0.5` が返ります。
 
 ```text
 input_value
     ↓
-16×16の疑似画像テンソル
+16×16 疑似画像テンソル
     ↓
 PyTorchによる平均値計算
     ↓
 score
     ↓
 MongoDBへ保存
+    ↓
+Redis ACK
 ```
+
+入力値が `0.5` の場合、概ね `0.5` が返ります。
 
 これは学習済みモデルによる画像認識や位置推定ではありません。
 
-GPUが利用できない環境ではCPUで推論します。本PoCのKubernetes性能測定はCPUで実施しました。
+GPUが利用できない場合はCPUを使用します。本PoCのKubernetes性能測定はCPUで実施しました。
 
-### 1.2 設計上の方針
+### 1.2 設計方針
 
-- 推論処理とジョブ投入をRedis Streamsで分離する。
-- MongoDB保存成功後にのみRedisのACKを送信する。
-- 未ACKジョブは再取得・再処理できるようにする。
-- 同じ `job_id` の再処理ではMongoDBのupsertを利用する。
-- 再試行上限を超えたジョブはDead Letter Streamに隔離する。
-- 推論処理時間と待機時間を分けて測定する。
-- 実装した機能と、実際に検証した機能を区別する。
+- ジョブ投入と推論処理をRedis Streamsで分離する。
+- MongoDB保存成功後にのみRedis ACKを送信する。
+- 未ACKジョブを再取得・再処理できるようにする。
+- `job_id` をキーにMongoDBの重複ドキュメントを防止する。
+- 再試行上限超過時にはDead Letter Streamへ隔離する。
+- Worker数を変更して並列処理を検証する。
+- Queue待機時間とWorker処理時間を分離する。
+- Worker内部のTensor生成・推論・MongoDB保存時間を分離する。
+- 計測条件と分析結果をRun ID単位で保存する。
+- 実装済みの機能と検証済みの機能を区別する。
 
 ## 2. 開発・検証環境
 
-2026年10月20日時点の主な検証環境です。
+2026年10月20〜21日に使用した主な検証環境です。
 
 | 項目 | 環境 |
 | --- | --- |
@@ -89,7 +106,7 @@ GPUが利用できない環境ではCPUで推論します。本PoCのKubernetes�
 | Docker Engine | 29系 |
 | Docker Compose | v2 |
 | kind | v0.33.0 |
-| Kubernetesノード | v1.37.0 |
+| Kubernetes | v1.37.0 |
 | PyTorch | 2.14.1+cpu |
 | NumPy | 2.5.4 |
 | Redis | 7系 |
@@ -98,7 +115,7 @@ GPUが利用できない環境ではCPUで推論します。本PoCのKubernetes�
 | PyMongo | 4系 |
 | 推論デバイス | CPU |
 
-Python依存ライブラリは [`requirements.txt`](requirements.txt) を参照してください。
+依存ライブラリは [`requirements.txt`](requirements.txt) を参照してください。
 
 ### 2.1 検証環境の制約
 
@@ -106,9 +123,16 @@ WSL2のメモリは約7.6GiB、Swapは2.0GiBです。
 
 性能測定時にはSwap使用量が上限に達していたことがあります。
 
-そのため、本READMEに掲載する計測値には、ホストのメモリ圧迫、CPUスケジューリング、Kubernetes Podの状態などが影響している可能性があります。
+このため、測定結果には以下の影響が含まれる可能性があります。
 
-**計測値は特定のローカル環境で得られた参考値であり、本番環境での性能保証値ではありません。**
+- ホストのメモリ圧迫
+- CPUスケジューリング
+- Kubernetes Podの実行状態
+- MongoDBの書き込みタイミング
+- Workerの初回処理
+- Docker / WSL2環境の負荷変動
+
+**本READMEの性能数値は特定のローカル環境で得られた実測値であり、本番環境の性能保証値ではありません。**
 
 ## 3. Docker Composeで動かす
 
@@ -122,27 +146,27 @@ docker compose up -d --build redis mongo worker
 docker compose ps
 ```
 
-### 3.2 Producerによるジョブ投入
+### 3.2 Producerによる投入
 
 ```bash
 docker compose run --rm producer
 ```
 
-Workerのログを確認します。
+Workerログを確認します。
 
 ```bash
 docker compose logs --tail=30 worker
 ```
 
-### 3.3 MongoDBの保存結果を確認
+### 3.3 MongoDB保存結果の確認
 
 ```bash
 docker compose exec -T mongo \
   mongosh ai_mobility --quiet --eval \
-  'db.inference_results.find({}, {_id:1, input_value:1, score:1, device:1}).sort({input_value:1}).forEach(printjson)'
+  'db.inference_results.find({}, {_id:1, input_value:1, score:1, device:1}).forEach(printjson)'
 ```
 
-保存件数を確認します。
+保存件数：
 
 ```bash
 docker compose exec -T mongo \
@@ -150,31 +174,32 @@ docker compose exec -T mongo \
   'db.inference_results.countDocuments({})'
 ```
 
-### 3.4 Redisの未ACK件数を確認
+### 3.4 Redis Pending確認
 
 ```bash
 docker compose exec -T redis \
   redis-cli XPENDING inference_jobs inference_workers
 ```
 
-正常処理が完了し、未処理のPendingが残っていなければ0件になります。
+正常処理後にPendingが残っていなければ0件になります。
 
-### 3.5 サービスの停止
+### 3.5 停止
 
 ```bash
 docker compose down
 ```
 
-> `docker compose down -v` はボリュームを削除します。保存データを残したい場合は実行しないでください。
+> `docker compose down -v` はボリュームも削除します。保存データを保持する場合は実行しないでください。
 
 ## 4. kind / Kubernetesで動かす
 
 ### 4.1 前提条件
 
-- `docker`、`kind`、`kubectl` が利用できること。
-- kindクラスタが作成済みでReadyになっていること。
-- Dockerイメージをkindに読み込めること。
-- PVCをプロビジョニングできるStorageClassがあること。
+- Docker、kind、kubectlが使用できる。
+- kindクラスタが作成済みである。
+- KubernetesノードがReadyである。
+- 必要なDockerイメージをkindへ読み込める。
+- PVCを使用できるStorageClassが存在する。
 
 検証には `go-k8s-poc` クラスタを使用しました。
 
@@ -188,6 +213,8 @@ kubectl get storageclass
 
 ### 4.2 Dockerイメージのビルドと読み込み
 
+基本構成：
+
 ```bash
 docker build -t ai-mobility-inference-poc:cpu .
 
@@ -196,42 +223,50 @@ kind load docker-image \
   --name go-k8s-poc
 ```
 
-イメージを更新した場合、kindへ再読み込みしたうえでWorkerを再起動します。
+2026年10月21日の詳細計測検証では、次のイメージを使用しました。
 
-```bash
-kubectl -n ai-mobility-poc \
-  rollout restart deployment/inference-worker
-
-kubectl -n ai-mobility-poc \
-  rollout status deployment/inference-worker \
-  --timeout=120s
+```text
+ai-mobility-inference-poc:metrics-20261021-01
 ```
 
-### 4.3 Kubernetesマニフェストの適用
+Workerへ適用する例：
+
+```bash
+kubectl -n ai-mobility-poc set image \
+  deployment/inference-worker \
+  worker=ai-mobility-inference-poc:metrics-20261021-01
+
+kubectl -n ai-mobility-poc rollout status \
+  deployment/inference-worker \
+  --timeout=180s
+```
+
+このタグは2026年10月21日のローカル検証用です。利用前に対象イメージをビルドし、kindクラスタへ読み込んでください。
+
+また、Deploymentのイメージを変更した場合は、`k8s/worker.yaml` の設定との差分に注意してください。
+
+### 4.3 マニフェストの適用
 
 ```bash
 kubectl apply -f k8s/namespace.yaml
 
 kubectl apply -f k8s/redis.yaml
 
-kubectl -n ai-mobility-poc \
-  rollout status deployment/redis \
-  --timeout=120s
+kubectl -n ai-mobility-poc rollout status \
+  deployment/redis --timeout=120s
 
 kubectl apply -f k8s/mongo.yaml
 
-kubectl -n ai-mobility-poc \
-  rollout status statefulset/mongo \
-  --timeout=180s
+kubectl -n ai-mobility-poc rollout status \
+  statefulset/mongo --timeout=180s
 
 kubectl apply -f k8s/worker.yaml
 
-kubectl -n ai-mobility-poc \
-  rollout status deployment/inference-worker \
-  --timeout=120s
+kubectl -n ai-mobility-poc rollout status \
+  deployment/inference-worker --timeout=120s
 ```
 
-起動状態を確認します。
+起動確認：
 
 ```bash
 kubectl -n ai-mobility-poc get pods -o wide
@@ -260,9 +295,11 @@ kubectl -n ai-mobility-poc \
 
 Kubernetes Jobは、同じ名前で再度 `apply` しても自動的には再実行されません。
 
-再実行にはJobの削除・再作成、または別名のJob作成が必要です。
+再実行する場合は、Jobの削除・再作成、または別名のJob作成が必要です。
 
-### 4.5 推論結果の確認
+### 4.5 結果確認
+
+MongoDB：
 
 ```bash
 kubectl -n ai-mobility-poc exec mongo-0 -- \
@@ -270,12 +307,14 @@ kubectl -n ai-mobility-poc exec mongo-0 -- \
   'db.inference_results.countDocuments({})'
 ```
 
+Redis：
+
 ```bash
 kubectl -n ai-mobility-poc exec deployment/redis -- \
   redis-cli XPENDING inference_jobs inference_workers
 ```
 
-Workerログは以下で確認します。
+Worker：
 
 ```bash
 kubectl -n ai-mobility-poc \
@@ -288,40 +327,40 @@ kubectl -n ai-mobility-poc \
 
 当初のRedis Listを利用した `BRPOP` 方式から、Redis StreamsとConsumer Groupを利用する設計に変更しました。
 
-通常処理の流れは以下です。
+通常処理は以下の順序です。
 
 1. Producerが `XADD` でジョブを登録する。
-2. Workerが `XREADGROUP` で取得する。
+2. Workerが `XREADGROUP` でジョブを取得する。
 3. Workerが入力値を検証する。
 4. PyTorchで推論を実行する。
 5. MongoDBに結果を保存する。
 6. 保存成功後に `XACK` を送信する。
 
-MongoDBの保存が失敗した場合、通常処理のACKは送信せず、ジョブをPendingとして残します。
+MongoDB保存に失敗した場合、通常処理のACKは送信せず、ジョブをPendingに残します。
 
-### 5.2 MongoDBへの冪等保存
+### 5.2 MongoDBへの重複防止保存
 
 MongoDBには `job_id` を `_id` として保存します。
 
 ```python
 collection.replace_one(
     {"_id": job_id},
-    record,
+    {"_id": job_id, **result},
     upsert=True,
 )
 ```
 
-この方式では、同じ `job_id` が再処理された場合、同じキーのドキュメントを置き換えられます。
+同じ `job_id` が再処理された場合は、同じキーのドキュメントを置き換えます。
 
-ただし、これはMongoDB上の重複ドキュメントを防ぐ仕組みです。
+これによってMongoDB上の重複ドキュメントを防ぎます。
 
-**RedisとMongoDBをまたぐexactly-once処理を保証するものではありません。**
+ただし、**RedisとMongoDBをまたぐexactly-once処理を保証するものではありません。**
 
 ### 5.3 Pendingジョブの再回収
 
 Workerは `XAUTOCLAIM` を利用して、一定時間Pendingとなったジョブを再取得します。
 
-現在の再回収閾値は次のとおりです。
+検証時の閾値：
 
 ```python
 RECLAIM_IDLE_MS = 30_000
@@ -329,35 +368,33 @@ RECLAIM_IDLE_MS = 30_000
 
 30秒以上アイドル状態のPendingジョブが再回収対象となります。
 
-この値は障害検証用の設定です。
+これは障害検証用の設定です。
 
-実運用では、正常な推論処理時間、MongoDBへの書き込み時間、負荷状態などを考慮して調整する必要があります。
+実運用では、正常な推論処理時間、MongoDB書き込み時間、負荷状態を考慮した調整が必要です。
 
-### 5.4 再試行上限とDead Letter Stream
+### 5.4 再試行上限とDLQ
 
 再試行制御は `src/retry_policy.py` に分離しています。
 
-配信回数はRedisのPending情報から取得します。
+配信回数はRedis Pending情報から取得します。
 
 ```python
 client.xpending_range(...)
 ```
 
-検証では、配信回数が上限を超えたジョブをDead Letter Streamへ隔離する動作を確認しました。
+検証した設定では最大3回の配信を処理対象とし、4回目の配信時に再試行上限超過として隔離しました。
 
-検証した設定では、最大3回の配信を処理対象とし、4回目の配信時に再試行上限超過として隔離しました。
-
-隔離先は以下です。
+隔離先：
 
 ```text
 inference_jobs_dead
 ```
 
-隔離記録には元のStream IDやエラー理由などを記録します。
+隔離記録には元のStream IDやエラー理由などを保存します。
 
-### 5.5 DLQへの登録とACK
+### 5.5 DLQ登録とACK
 
-Dead Letter Streamへの登録と元ジョブのACKにはRedisのトランザクション付きPipelineを使用します。
+Dead Letter Streamへの登録と元ジョブのACKにはRedisトランザクション付きPipelineを使用します。
 
 ```python
 with client.pipeline(transaction=True) as pipe:
@@ -366,25 +403,23 @@ with client.pipeline(transaction=True) as pipe:
     results = pipe.execute()
 ```
 
-これにより、DLQ登録とACKをRedisトランザクション内で実行します。
+これによってDLQ登録とACKをRedisトランザクション内で実行します。
 
-ただし、外部システムとの整合性や障害時の全条件を保証するものではありません。
+ただし、外部システムとの整合性や障害時のすべての条件を保証するものではありません。
 
-### 5.6 障害復旧の検証結果
+### 5.6 障害復旧検証
 
-以下のシナリオについて、動作確認を実施しました。
-
-| 検証シナリオ | 確認結果 |
+| 検証シナリオ | 結果 |
 | --- | --- |
 | Worker停止・Pod再作成 | Pendingジョブの再回収を確認 |
-| MongoDB停止時の保存失敗 | ACKされずPendingに残る動作を確認 |
+| MongoDB停止時の保存失敗 | ACKせずPendingに残る |
 | MongoDB復旧後の再処理 | 保存成功とACKを確認 |
-| 不正な入力値 | Dead Letter Streamへの隔離を確認 |
-| 再試行上限超過 | 4回目の配信でDLQ隔離を確認 |
+| 不正入力値 | DLQへの隔離を確認 |
+| 再試行上限超過 | 4回目の配信でDLQ隔離 |
 | DLQ隔離後 | 元ジョブのACKを確認 |
 | 正常ジョブ | MongoDB保存とACKを確認 |
 
-これらはローカルkind環境での検証結果です。
+これらはローカルkind環境における検証結果です。
 
 Redis自体の長時間停止、複数ノード障害、ネットワーク分断、永続ストレージ障害からの復旧までは検証していません。
 
@@ -392,42 +427,47 @@ Redis自体の長時間停止、複数ノード障害、ネットワーク分断
 
 本PoCは**at-least-onceを目指した非同期処理設計**です。
 
-未ACKジョブの再取得によって処理を再実行できますが、再試行上限を設けているため、すべてのジョブが必ず正常完了するわけではありません。
+ただし、再試行上限を設けているため、すべてのジョブの正常完了を保証するものではありません。
 
-また、以下の制約があります。
+主な制約：
 
 - 同じジョブが複数回推論される可能性がある。
 - MongoDB保存とRedis ACKは分散トランザクションではない。
-- 再試行上限を超えたジョブはDLQへ隔離する。
-- DLQからの自動再投入・再処理機能は未実装。
-- 指数バックオフによる再試行間隔の調整は未実装。
+- 再試行上限超過時にはDLQへ隔離する。
+- DLQからの自動再投入は未実装。
+- 指数バックオフによる再試行調整は未実装。
 
-## 6. 性能計測と検証結果（2026-10-20）
+## 6. 性能計測と検証結果
+
+2026年10月20〜21日に実施した性能検証をまとめます。
 
 ### 6.1 計測の目的
 
-本PoCでは、推論処理そのものの速度だけでなく、非同期ジョブが投入されてから結果保存されるまでの時間を測定しました。
-
-主な計測指標は以下です。
+推論処理そのものの速度だけでなく、ジョブ投入から結果保存までの時間を分析します。
 
 | 指標 | 意味 |
 | --- | --- |
-| `elapsed_ms` | Worker処理開始からACK処理後までの経過時間 |
-| `queue_ms` | Redisへのジョブ登録からWorker処理開始まで |
+| `elapsed_ms` | Worker処理開始からACK処理後まで |
+| `queue_ms` | Redis登録からWorker処理開始まで |
 | `worker_ms` | Worker処理開始からMongoDB保存成功まで |
 | `e2e_ms` | Redis登録からMongoDB保存成功まで |
-| `redis_wait_ms` | Redis登録からWorkerが取得結果を受け取るまで |
-| `dispatch_wait_ms` | Redis取得結果の受信から対象ジョブの処理開始まで |
+| `redis_wait_ms` | Redis登録から取得結果受信まで |
+| `dispatch_wait_ms` | 取得結果受信から処理開始まで |
+| `tensor_ms` | 疑似画像テンソル生成時間 |
+| `inference_ms` | PyTorch推論時間 |
+| `mongo_save_ms` | MongoDB保存処理時間 |
 
-ログには以下の形式で記録します。
+ログ例：
 
 ```text
-Processed: job_id=..., stream_id=..., score=..., elapsed_ms=..., queue_ms=..., worker_ms=..., e2e_ms=..., redis_wait_ms=..., dispatch_wait_ms=..., ack=1
+Processed: job_id=..., stream_id=..., score=...,
+elapsed_ms=..., queue_ms=..., worker_ms=...,
+e2e_ms=..., redis_wait_ms=...,
+dispatch_wait_ms=..., tensor_ms=...,
+inference_ms=..., mongo_save_ms=..., ack=1
 ```
 
 ### 6.2 計測区間の関係
-
-以下の関係が成立するように計算しています。
 
 ```text
 Queue Latency
@@ -439,7 +479,7 @@ End-to-End Latency
     + Worker Latency
 ```
 
-数式では以下のようになります。
+計算上は次の関係となります。
 
 ```text
 queue_ms ≒ redis_wait_ms + dispatch_wait_ms
@@ -447,58 +487,51 @@ queue_ms ≒ redis_wait_ms + dispatch_wait_ms
 e2e_ms ≒ queue_ms + worker_ms
 ```
 
-各計測値は小数点以下で丸めるため、わずかな差が生じる場合があります。
+各計測値は丸め処理の影響でわずかな差が生じる場合があります。
 
-なお、`redis_wait_ms` はRedisサーバー内部の待機時間だけを表すものではありません。
+`redis_wait_ms` はRedisサーバー内部の待機時間だけを表すものではありません。
 
-先行ジョブの処理中にWorkerが次の取得APIを呼び出せない時間や、通信・応答時間も含まれます。
+先行ジョブの処理によってWorkerが次の取得APIを呼び出せない時間や、通信・応答時間も含みます。
 
-同様に、`dispatch_wait_ms` には先行ジョブの処理待ちや配信回数の確認処理などが含まれます。
+### 6.3 Stream IDによる登録時刻取得
 
-### 6.3 Stream IDを利用した登録時刻の取得
-
-Redis StreamsのメッセージIDに含まれるミリ秒単位のタイムスタンプを、登録時刻として利用しています。
+Redis StreamsのメッセージIDに含まれるミリ秒単位のタイムスタンプを、ジョブ登録時刻として利用します。
 
 ```text
 1792482417239-0
 ```
 
-先頭の数値をUnix時刻のミリ秒として解釈し、Worker側で取得したUTC時刻との差分を計算しています。
+先頭の数値をUnix時刻のミリ秒として解釈し、Worker側で取得したUTC時刻との差分を計算します。
 
-この計測方法はRedisサーバーとWorkerの時刻整合性に依存します。
-
-本PoCでは同一kindクラスタ上で検証していますが、異なるホスト間での時計ずれを厳密に補正する仕組みはありません。
+この方式はRedisサーバーとWorkerの時計の整合性に依存します。
 
 ### 6.4 Docker Composeの基本検証
 
-初期の3件投入で以下を確認しました。
+初期3件投入で次を確認しました。
 
 | 項目 | 結果 |
 | --- | --- |
 | Redis Streamsへの投入 | 3件成功 |
-| Workerでの推論 | 3件成功 |
-| MongoDBへの保存 | 3件成功 |
-| `XACK` | 各件 `ack=1` |
-| `XPENDING` | 0件 |
-| 初期のWorker処理時間 | 112.93 / 3.29 / 2.34 ms |
+| Worker推論 | 3件成功 |
+| MongoDB保存 | 3件成功 |
+| Redis ACK | 各件 `ack=1` |
+| Pending | 0件 |
+| Worker処理時間 | 112.93 / 3.29 / 2.34ms |
 
-この処理時間は初期動作確認時の実測ログであり、ベンチマーク結果ではありません。
+これらは初期動作確認時のログであり、ベンチマーク結果ではありません。
 
 ### 6.5 Kubernetes基本動作
 
-kind環境では以下を確認しました。
-
 | 項目 | 結果 |
 | --- | --- |
-| Redis・MongoDB・Worker | Ready |
+| Redis / MongoDB / Worker | Ready |
 | Redis PVC / MongoDB PVC | Bound |
 | Producer Job | Completed |
-| MongoDBへの結果保存 | 成功 |
-| 未ACK数 | 正常処理後0件 |
+| MongoDB保存 | 成功 |
+| Pending | 正常処理後0件 |
 | CPU推論 | 成功 |
-| Workerログ | `ack=1` を確認 |
 
-初期の3件投入では、以下の推論結果を確認しました。
+初期の推論結果：
 
 | `input_value` | `score` | `device` |
 | ---: | ---: | --- |
@@ -506,18 +539,18 @@ kind環境では以下を確認しました。
 | 0.5 | 0.5 | cpu |
 | 0.8 | 0.8000001311302185 | cpu |
 
-浮動小数点の丸め誤差があります。
+浮動小数点演算による丸め誤差があります。
 
-### 6.6 100件のPipeline投入試験
+### 6.6 100件のPipeline投入
 
-Redisへのジョブ投入方式による影響を調べるため、PythonのRedis Pipelineによる100件の一括投入を実装しました。
+Redis Pipelineを利用して100件のジョブを一括投入する仕組みを実装しました。
 
 使用ファイル：
 
 - `scripts/benchmark_producer.py`
 - `k8s/benchmark-producer-job.yaml`
 
-Producer側では以下の方式で投入します。
+Producer側の実装例：
 
 ```python
 with client.pipeline(transaction=False) as pipe:
@@ -532,62 +565,35 @@ with client.pipeline(transaction=False) as pipe:
     pipe.execute()
 ```
 
-Kubernetes Jobから投入した3回の例は以下です。
+2026年10月20日の実測例：
 
 | Run ID | Producer実行時間 | 投入件数 |
 | --- | ---: | ---: |
-| `perf-pipeline-20261020154224` | 9.869 ms | 100 |
-| `perf-pipeline-20261020155552` | 3.013 ms | 100 |
-| `perf-pipeline-20261020160512` | 3.231 ms | 100 |
+| `perf-pipeline-20261020154224` | 9.869ms | 100 |
+| `perf-pipeline-20261020155552` | 3.013ms | 100 |
+| `perf-pipeline-20261020160512` | 3.231ms | 100 |
 
-各試験で100件すべての保存と、最終的なPending 0件を確認しました。
+いずれも100件の保存とPending 0件を確認しました。
 
-Producer実行時間はRedisへの投入処理に要した時間であり、100件すべての推論完了時間ではありません。
+Producer実行時間はRedisへの投入時間であり、推論完了までの時間ではありません。
 
 ### 6.7 Pipeline方式のE2E性能
 
-各条件100件の計測結果です。
-
 | Run ID | E2E平均 | E2E p95 | E2E p99 |
 | --- | ---: | ---: | ---: |
-| `perf-pipeline-20261020154224` | 340.510 ms | 454.554 ms | 460.938 ms |
-| `perf-pipeline-20261020155552` | 97.161 ms | 162.301 ms | 166.915 ms |
-| `perf-pipeline-20261020160512` | 163.619 ms | 269.401 ms | 279.541 ms |
+| `perf-pipeline-20261020154224` | 340.510ms | 454.554ms | 460.938ms |
+| `perf-pipeline-20261020155552` | 97.161ms | 162.301ms | 166.915ms |
+| `perf-pipeline-20261020160512` | 163.619ms | 269.401ms | 279.541ms |
 
-この結果から、同じ100件のPipeline投入でもE2E時間に大きなばらつきがあることが分かりました。
+同じ100件の投入でも、E2E時間には大きなばらつきがありました。
 
-原因候補には以下があります。
+原因候補として、Workerのウォームアップ、WSL2のメモリ・Swap状態、CPUスケジューリング、Redis取得タイミング、MongoDB保存時間などが考えられます。
 
-- Workerの初回処理・ウォームアップ
-- WSL2のメモリとSwapの状態
-- KubernetesのCPUスケジューリング
-- Redis取得タイミング
-- MongoDB保存時間
-- 単一Workerによる逐次処理
+各要因の寄与度は未確定です。
 
-これらの寄与度は未確定です。
+### 6.8 Queue待機時間の分解
 
-### 6.8 待機時間の分解
-
-Queue Latencyをさらに分析するため、次の2つに分離しました。
-
-```text
-Queue Latency
-├── redis_wait_ms
-└── dispatch_wait_ms
-```
-
-WorkerがRedisから最大10件を一度に取得して逐次処理する場合、後続ジョブには取得後の順番待ちが発生します。
-
-この影響を調べるため、取得時刻 `received_at` を記録する処理を追加しました。
-
-測定結果：
-
-| 指標 | 平均 | p95 | p99 |
-| --- | ---: | ---: | ---: |
-| Redis取得前待機 | 167.340 ms | 323.177 ms | 323.177 ms |
-| 取得後待機 | 14.465 ms | 29.700 ms | 36.760 ms |
-| Queue合計 | 181.805 ms | 332.704 ms | 341.139 ms |
+Queue LatencyをRedis取得前と取得後の待機に分離しました。
 
 対象Run ID：
 
@@ -595,17 +601,19 @@ WorkerがRedisから最大10件を一度に取得して逐次処理する場合�
 perf-dispatch-20261020163402
 ```
 
-投入100件、処理完了100件、Pending 0件でした。
+| 指標 | 平均 | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| Redis取得前待機 | 167.340ms | 323.177ms | 323.177ms |
+| 取得後待機 | 14.465ms | 29.700ms | 36.760ms |
+| Queue合計 | 181.805ms | 332.704ms | 341.139ms |
 
-この測定では、Queue Latencyの平均のうち約92%がRedis取得前の区間に含まれていました。
+この測定では、Queue Latency平均の約92%がRedis取得前の区間に含まれていました。
 
-ただし、これはRedisサーバー内部で92%の時間を消費しているという意味ではありません。
+ただし、Redisサーバー内部で92%の時間を消費していたという意味ではありません。
 
-### 6.9 READ_BATCH_SIZEによる比較
+### 6.9 READ_BATCH_SIZEの比較
 
-通常のジョブ取得に使う `XREADGROUP` のバッチサイズを変更できるようにしました。
-
-環境変数：
+通常の `XREADGROUP` で使用する取得バッチサイズを変更できるようにしました。
 
 ```text
 READ_BATCH_SIZE
@@ -613,20 +621,16 @@ READ_BATCH_SIZE
 
 未指定時の既定値は10です。
 
-```python
-batch_size = int(
-    os.getenv("READ_BATCH_SIZE", "10")
-)
+比較した条件：
+
+```text
+READ_BATCH_SIZE=10
+READ_BATCH_SIZE=1
 ```
 
-比較した条件は以下です。
+`XAUTOCLAIM` の取得件数は10のままです。
 
-- `READ_BATCH_SIZE=10`
-- `READ_BATCH_SIZE=1`
-
-`XAUTOCLAIM` の取得件数は10のまま維持しています。
-
-Kubernetes上でバッチサイズを1に変更する場合：
+バッチサイズを1に変更する例：
 
 ```bash
 kubectl -n ai-mobility-poc set env \
@@ -638,93 +642,378 @@ kubectl -n ai-mobility-poc rollout status \
   --timeout=180s
 ```
 
-10に戻す場合：
+元に戻す場合：
 
 ```bash
 kubectl -n ai-mobility-poc set env \
   deployment/inference-worker \
   READ_BATCH_SIZE=10
-
-kubectl -n ai-mobility-poc rollout status \
-  deployment/inference-worker \
-  --timeout=180s
 ```
 
-`kubectl set env` による変更は稼働中Deploymentへの設定です。
+### 6.10 バッチサイズ別E2E性能
 
-マニフェストを再適用する際は、`k8s/worker.yaml` の設定との整合性に注意してください。
-
-### 6.10 バッチサイズ別のE2E性能
-
-それぞれ100件をPipeline投入した単発試験です。
+各条件100件の単発測定です。
 
 | 指標 | count=10 | count=1 |
 | --- | ---: | ---: |
 | 処理成功件数 | 100 | 100 |
-| E2E平均 | 183.706 ms | 184.300 ms |
-| E2E p50 | 187.608 ms | 193.269 ms |
-| E2E p95 | 334.119 ms | 312.091 ms |
-| E2E p99 | 342.224 ms | 336.475 ms |
-| E2E最大 | 346.293 ms | 338.839 ms |
+| E2E平均 | 183.706ms | 184.300ms |
+| E2E p50 | 187.608ms | 193.269ms |
+| E2E p95 | 334.119ms | 312.091ms |
+| E2E p99 | 342.224ms | 336.475ms |
+| E2E最大 | 346.293ms | 338.839ms |
 
 対象Run ID：
 
 ```text
-count=10:
-perf-dispatch-20261020163402
-
-count=1:
-perf-batch1-20261020164612
+count=10: perf-dispatch-20261020163402
+count=1 : perf-batch1-20261020164612
 ```
 
-今回の単発測定では、`count=1` のE2E p95が約6.6%短くなりました。
+単発測定では `count=1` のE2E p95が約6.6%短くなりました。
 
-一方で、E2E平均はほぼ同じであり、p50はやや長くなりました。
+ただし、E2E平均はほぼ同じであり、バッチサイズの最適値はまだ確定できません。
 
 ### 6.11 バッチサイズ別の待機時間
 
 | 指標 | count=10 | count=1 |
 | --- | ---: | ---: |
-| Redis取得前待機・平均 | 167.340 ms | 182.362 ms |
-| Redis取得前待機・p95 | 323.177 ms | 310.541 ms |
-| 取得後待機・平均 | 14.465 ms | 0.339 ms |
-| 取得後待機・p95 | 29.700 ms | 0.770 ms |
-| Queue合計・平均 | 181.805 ms | 182.702 ms |
-| Queue合計・p95 | 332.704 ms | 310.737 ms |
+| Redis取得前待機・平均 | 167.340ms | 182.362ms |
+| Redis取得前待機・p95 | 323.177ms | 310.541ms |
+| 取得後待機・平均 | 14.465ms | 0.339ms |
+| 取得後待機・p95 | 29.700ms | 0.770ms |
+| Queue合計・平均 | 181.805ms | 182.702ms |
+| Queue合計・p95 | 332.704ms | 310.737ms |
 
-取得後待機の平均は次のように変化しました。
+バッチサイズ1では取得後待機が大きく短縮されました。
+
+一方、Queue全体の平均時間はほとんど変化していません。
+
+つまり、取得後待機の短縮が、そのままE2E性能全体の改善につながるわけではありません。
+
+### 6.12 Workerレプリカ数の比較（Phase 6）
+
+2026年10月21日、Worker 1台と2台の性能を比較しました。
+
+主な条件：
+
+| 項目 | 条件 |
+| --- | --- |
+| クラスタ | kind / 単一ノード |
+| 投入件数 | 各Run 100件 |
+| 投入方式 | Redis Pipeline |
+| `READ_BATCH_SIZE` | 1 |
+| 推論デバイス | CPU |
+| Worker数 | 1台 / 2台 |
+| 測定回数 | 各3回 |
+| ウォームアップ | 各構成で実施 |
+
+E2E p95の結果：
+
+| Run | Worker 1台 | Worker 2台 |
+| --- | ---: | ---: |
+| 1 | 365.421ms | 414.752ms |
+| 2 | 442.166ms | 162.400ms |
+| 3 | 471.186ms | 170.095ms |
+| **中央値** | **442.166ms** | **170.095ms** |
+
+この3回の測定では、Worker 2台構成のE2E p95中央値が約61.5%短くなりました。
+
+Redis取得前待機のp95中央値：
+
+| 条件 | p95中央値 |
+| --- | ---: |
+| Worker 1台 | 441.203ms |
+| Worker 2台 | 168.204ms |
+
+Workerの並列化によって後続ジョブの待機が短縮される可能性を確認しました。
+
+ただし、Worker 2台構成のRun 1では、初期ジョブに約175〜183msのWorker処理時間が発生し、その後のジョブに影響した可能性があります。
+
+また、測定順序、ホスト負荷、メモリ状態などを十分に統制できていないため、**Worker数の増加だけが性能差の原因であるとは断定できません。**
+
+### 6.13 Worker内部処理の詳細計測（Phase 7）
+
+Worker内部の処理時間を以下に分解しました。
 
 ```text
-count=10 : 14.465 ms
-count=1  :  0.339 ms
+Worker Latency
+    ├── Tensor生成
+    ├── PyTorch推論
+    ├── MongoDB保存
+    └── 入力検証・計測などの付随処理
 ```
 
-`count=1` では、取得後に他のジョブの処理完了を待つ時間が大きく減りました。
+追加した計測項目：
 
-しかし、Queue Latency全体の平均はほとんど変化していません。
+| 指標 | 内容 |
+| --- | --- |
+| `tensor_ms` | Tensor生成 |
+| `inference_ms` | PyTorch推論 |
+| `mongo_save_ms` | MongoDB保存 |
+| `worker_ms` | Worker全体 |
 
-つまり、取得後待機の短縮が、そのままE2E性能の改善につながるわけではありません。
+`mongo_save_ms` は `save_result()` の呼び出し全体の経過時間です。
 
-### 6.12 現時点での性能評価
+MongoDBサーバー内部の純粋な書き込み時間だけを示す値ではありません。
 
-今回の検証から、以下を確認しました。
+計測用Dockerイメージ：
 
-1. 100件のPipeline投入と結果保存は正常に完了した。
-2. Redisの未ACK件数は処理完了後0件となった。
+```text
+ai-mobility-inference-poc:metrics-20261021-01
+```
+
+Worker 1台・100件×3回の測定結果：
+
+| Run ID | Worker最大 | MongoDB p95 | MongoDB最大 | 推論 p95 |
+| --- | ---: | ---: | ---: | ---: |
+| `perf-r1-20261021110159-1` | 17.556ms | 2.225ms | 17.262ms | 0.267ms |
+| `perf-r1-20261021110626-1` | 4.303ms | 2.363ms | 3.199ms | 0.396ms |
+| `perf-r1-20261021110634-2` | 3.468ms | 1.800ms | 2.527ms | 0.316ms |
+
+3回のp95中央値：
+
+| 指標 | 中央値 |
+| --- | ---: |
+| MongoDB保存 | 2.225ms |
+| PyTorch推論 | 0.316ms |
+
+この測定では、推論処理は通常1ms未満で完了していました。
+
+一方、MongoDB保存がWorker内部処理時間の大きな割合を占めるケースがありました。
+
+### 6.14 MongoDB保存時間の変動
+
+詳細計測を追加した後の別Runでは、MongoDB保存時間にさらに大きな変動が見られました。
+
+| Run ID | E2E p95 | MongoDB p95 | MongoDB最大 |
+| --- | ---: | ---: | ---: |
+| `perf-r1-20261021112337-1-2469239` | 787.866ms | 8.235ms | 102.071ms |
+| `perf-r1-20261021114040-1-2488703` | 283.742ms | 1.360ms | — |
+| `perf-r1-20261021114904-1-2498272` | 380.034ms | 1.494ms | 106.875ms |
+
+最初のRunでは以下のジョブが特に遅くなりました。
+
+| ジョブ | Worker全体 | Tensor生成 | 推論 | MongoDB保存 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 141.898ms | 15.399ms | 22.424ms | 102.071ms |
+| 2 | 31.225ms | 0.110ms | 0.274ms | 30.806ms |
+| 26 | 54.224ms | 0.113ms | 0.287ms | 53.781ms |
+
+MongoDB保存の突発的な遅延は複数回観測されました。
+
+ただし、現時点では以下のどの要因によるものか特定していません。
+
+- MongoDBサーバー内部の処理
+- PyMongoのクライアント側処理
+- ネットワーク通信
+- ホスト環境の負荷変動
+- ストレージI/O
+- その他の実行環境要因
+
+### 6.15 MongoDB接続管理の確認
+
+`src/database.py` では、Worker起動時に `MongoClient` を生成し、取得したCollectionをジョブ処理で使い回します。
+
+```python
+def get_collection():
+    client = MongoClient(
+        os.getenv("MONGO_URI", "mongodb://mongo:27017/"),
+        serverSelectionTimeoutMS=5000,
+    )
+
+    database = client["ai_mobility"]
+    return database["inference_results"]
+```
+
+保存処理：
+
+```python
+collection.replace_one(
+    {"_id": job_id},
+    {"_id": job_id, **result},
+    upsert=True,
+)
+```
+
+Worker自身がジョブごとに `MongoClient` を新規作成する実装ではありません。
+
+また、調査時点で以下を確認しました。
+
+- MongoDB接続拒否は0件。
+- 接続確立待ちは0件。
+- ロック待機は0件。
+- WiredTigerキャッシュ使用量は上限に対して小さい。
+- WorkerとMongoDBのPod再起動は0回。
+
+ただし、これらは主に負荷試験後の状態であり、試験中の瞬間的な異常を否定するものではありません。
+
+### 6.16 ベンチマーク自動化（Phase 8）
+
+2026年10月21日、`scripts/run_replica_benchmark.sh` により、ベンチマークの実行と結果収集を自動化しました。
+
+主な処理：
+
+1. Workerレプリカ数を検証する。
+2. Redis Pendingが0件であることを確認する。
+3. Run IDを生成する。
+4. Producer Jobを作成して100件投入する。
+5. MongoDBの保存件数を確認する。
+6. Redis Pendingが0件になるまで待機する。
+7. Pod別のWorkerログを収集する。
+8. E2E / Dispatch / Worker内部処理時間を分析する。
+9. MongoDB統計を実行前後で取得する。
+10. MongoDB統計差分を計算する。
+11. 結果をJSONおよびCSVへ保存する。
+
+実行例：
+
+```bash
+./scripts/run_replica_benchmark.sh 1 3
+```
+
+引数：
+
+```text
+第1引数：Workerレプリカ数（1または2）
+第2引数：実行回数（省略時3）
+```
+
+Worker 2台構成の場合：
+
+```bash
+kubectl -n ai-mobility-poc scale \
+  deployment/inference-worker --replicas=2
+
+kubectl -n ai-mobility-poc rollout status \
+  deployment/inference-worker --timeout=180s
+
+./scripts/run_replica_benchmark.sh 2 3
+```
+
+測定スクリプト自体はWorker数を変更しません。
+
+Deploymentの希望レプリカ数とReadyレプリカ数が指定値に一致していることを確認して実行します。
+
+詳細計測に対応したWorkerイメージを使用してください。
+
+### 6.17 ベンチマークの出力ファイル
+
+結果はRun IDごとのディレクトリに保存します。
+
+```text
+output/
+└── replica-comparison/
+    ├── worker1/
+    │   ├── summary.csv
+    │   └── perf-r1-<日時>-<回数>-<PID>/
+    │       ├── job.yaml
+    │       ├── producer.json
+    │       ├── worker.log
+    │       ├── workers.csv
+    │       ├── <Pod名>.log
+    │       ├── e2e.json
+    │       ├── dispatch.json
+    │       ├── breakdown.json
+    │       ├── mongodb-before.json
+    │       ├── mongodb-after.json
+    │       └── mongodb-delta.json
+    └── worker2/
+        ├── summary.csv
+        └── <Run ID>/
+```
+
+| ファイル | 内容 |
+| --- | --- |
+| `job.yaml` | 実行したProducer Jobの定義 |
+| `producer.json` | 投入件数・投入時間 |
+| `worker.log` | 対象Run IDのWorkerログ |
+| `workers.csv` | Pod別処理件数 |
+| `e2e.json` | E2E / Queue / Worker分析 |
+| `dispatch.json` | Redis取得前・取得後待機 |
+| `breakdown.json` | Tensor生成・推論・MongoDB保存時間 |
+| `mongodb-before.json` | 実行前のMongoDB統計 |
+| `mongodb-after.json` | 実行後のMongoDB統計 |
+| `mongodb-delta.json` | MongoDB統計差分 |
+| `summary.csv` | Run単位の主要指標一覧 |
+
+スクリプトは各Runについて100件の完了と詳細計測ログの整合性を確認します。
+
+ただし、現時点ではジョブID単位の重複・欠落確認や測定中のシステムリソース記録には改善余地があります。
+
+### 6.18 MongoDB統計の自動収集
+
+MongoDBの `serverStatus()` を利用し、測定前後の統計値をJSON形式で保存します。
+
+統計取得：
+
+```text
+scripts/mongodb/collect_stats.js
+```
+
+差分分析：
+
+```text
+scripts/mongodb/analyze_stats.py
+```
+
+手動取得例：
+
+```bash
+kubectl -n ai-mobility-poc exec mongo-0 -- \
+  mongosh ai_mobility --quiet --eval \
+  "$(cat scripts/mongodb/collect_stats.js)"
+```
+
+差分分析例：
+
+```bash
+python scripts/mongodb/analyze_stats.py \
+  mongodb-before.json \
+  mongodb-after.json
+```
+
+Run `perf-r1-20261021114040-1-2488703` では以下の差分が確認されました。
+
+| 指標 | 差分 |
+| --- | ---: |
+| Update操作数 | +100 |
+| Query操作数 | +3 |
+| 接続作成数 | +9 |
+| 接続拒否数 | 0 |
+| キャッシュ使用量 | +48,012 bytes |
+| Dirty Bytes | +268,770 bytes |
+
+Update操作数は100件のジョブ処理数と一致しました。
+
+ただし、MongoDBの `serverStatus()` はサーバー全体の統計です。
+
+ベンチマーク以外の操作や、保存件数確認用の `mongosh` による接続も含まれます。
+
+また、前後差分は瞬間的な保存遅延の発生原因を直接示すものではありません。
+
+### 6.19 性能検証の総合評価
+
+これまでの検証から、以下を確認しました。
+
+1. Redis Pipelineによる100件投入とMongoDB保存が成功した。
+2. 正常完了後のPendingは0件となった。
 3. E2E性能はWorker処理時間だけでなく待機時間の影響を強く受ける。
-4. `count=1` では取得後待機が短くなる。
-5. Queue全体の平均時間はバッチサイズ変更だけでは大きく改善しなかった。
-6. E2E p95の差には、実行環境の変動が含まれている可能性がある。
+4. `READ_BATCH_SIZE=1` では取得後待機が短縮した。
+5. バッチサイズ変更だけではQueue全体の平均時間は大きく改善しなかった。
+6. Worker 2台構成ではE2E p95中央値が短縮する傾向が観測された。
+7. 継続稼働時の小規模PyTorch推論は通常1ms未満だった。
+8. MongoDB保存時間には突発的な100ms超の遅延が観測された。
+9. MongoDB接続上限やキャッシュ不足を示す明確な証拠は得られていない。
+10. ベンチマーク実行と分析結果の保存を自動化できた。
 
-**バッチサイズ1と10のどちらが最適かは、現時点では未判定です。**
-
-両条件をそれぞれ複数回測定し、再現性と変動幅を比較する必要があります。
+**Worker数・バッチサイズの最適値、およびMongoDB保存遅延の原因は未確定です。**
 
 ## 7. テストと分析スクリプト
 
 ### 7.1 pytest
 
-ホスト側のPython仮想環境から実行します。
+ホスト側のPython仮想環境で実行します。
 
 ```bash
 python -m venv .venv
@@ -738,39 +1027,43 @@ python -m pip install pytest
 python -m pytest -q
 ```
 
-2026年10月20日時点での実行結果：
+2026年10月21日時点の確認結果：
 
 ```text
-27 passed
+31 passed
 ```
 
 主なテスト対象：
 
 | テストファイル | 対象 |
 | --- | --- |
-| `tests/test_inference.py` | CPU推論・推論結果 |
+| `tests/test_inference.py` | CPU推論 |
 | `tests/test_retry_policy.py` | 再試行上限・DLQ判定 |
-| `tests/test_worker_retry.py` | Workerの再試行制御 |
-| `tests/test_performance_metrics.py` | 時刻・レイテンシ計算 |
-| `tests/test_analyze_e2e.py` | E2Eログ解析と互換性 |
+| `tests/test_worker_retry.py` | Worker再試行 |
+| `tests/test_performance_metrics.py` | レイテンシ計算 |
+| `tests/test_analyze_e2e.py` | E2E分析 |
+| `tests/test_analyze_worker_breakdown.py` | Worker詳細分析 |
+| `tests/test_metric_log_compatibility.py` | 新旧ログ互換性 |
 
-pytestでは主にロジック単位の動作を確認しています。
+pytestは主にロジック単位の検証です。
 
-実際のRedis、MongoDB、Kubernetesを使った障害試験や性能試験は、これらとは別に実施しました。
+実際のRedis、MongoDB、Kubernetesを使用した障害試験や負荷試験は別途実施しました。
 
-### 7.2 性能分析スクリプト
+### 7.2 分析スクリプト
 
 | ファイル | 用途 |
 | --- | --- |
-| `scripts/analyze_performance.py` | Worker処理時間の分析 |
+| `scripts/analyze_performance.py` | Worker処理時間分析 |
 | `scripts/analyze_e2e.py` | Queue / Worker / E2E分析 |
-| `scripts/analyze_dispatch.py` | Redis取得前・取得後待機の分析 |
-| `scripts/benchmark_producer.py` | Redis Pipelineによるジョブ投入 |
-| `scripts/run_benchmark.sh` | 繰り返し性能試験 |
+| `scripts/analyze_dispatch.py` | Redis待機時間分解 |
+| `scripts/analyze_worker_breakdown.py` | Worker詳細計測 |
+| `scripts/benchmark_producer.py` | Redis Pipeline投入 |
+| `scripts/run_benchmark.sh` | 既存の繰り返し試験 |
+| `scripts/run_replica_benchmark.sh` | レプリカ比較・自動集計 |
+| `scripts/mongodb/collect_stats.js` | MongoDB統計取得 |
+| `scripts/mongodb/analyze_stats.py` | MongoDB統計差分分析 |
 
 ### 7.3 E2E分析
-
-Workerログを保存して分析します。
 
 ```bash
 python scripts/analyze_e2e.py \
@@ -788,7 +1081,7 @@ worker_latency
 end_to_end_latency
 ```
 
-レイテンシには以下の統計値を含めます。
+各レイテンシは以下の統計を持ちます。
 
 ```text
 mean_ms
@@ -798,9 +1091,7 @@ p99_ms
 max_ms
 ```
 
-新しい `redis_wait_ms` と `dispatch_wait_ms` を含むログ形式にも対応しています。
-
-### 7.4 待機時間の分解分析
+### 7.4 Redis待機時間分析
 
 ```bash
 python scripts/analyze_dispatch.py \
@@ -808,7 +1099,7 @@ python scripts/analyze_dispatch.py \
   perf-example
 ```
 
-主な出力項目：
+主な出力：
 
 ```text
 completed_jobs
@@ -818,57 +1109,55 @@ queue_latency
 max_decomposition_error_ms
 ```
 
-100件の実測では、Queue Latencyの分解誤差が0.0msとなることを確認しました。
-
-### 7.5 PipelineベンチマークJob
-
-Kubernetes上で使用するProducerスクリプトをConfigMapへ登録します。
+### 7.5 Worker内部処理分析
 
 ```bash
-kubectl -n ai-mobility-poc create configmap benchmark-producer \
+python scripts/analyze_worker_breakdown.py \
+  output/worker.log \
+  perf-example
+```
+
+主な出力：
+
+```text
+completed_jobs_with_breakdown
+worker_ms
+tensor_ms
+inference_ms
+mongo_save_ms
+slowest_jobs
+```
+
+旧ログ形式のデータには詳細計測項目が存在しないため、その場合は詳細分析の対象外となります。
+
+### 7.6 PipelineベンチマークJob
+
+ProducerスクリプトをConfigMapへ登録します。
+
+```bash
+kubectl -n ai-mobility-poc create configmap \
+  benchmark-producer \
   --from-file=benchmark_producer.py=scripts/benchmark_producer.py \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Jobテンプレートは次のファイルです。
+Jobテンプレート：
 
 ```text
 k8s/benchmark-producer-job.yaml
 ```
 
-既存のJobと名前が重複しないよう、実行時にはJob名とRun IDを変更します。
+Job名の重複を防ぎ、Run ID単位でデータを分離するため、通常は `run_replica_benchmark.sh` の利用を推奨します。
 
-Jobテンプレートでは、ConfigMap名 `benchmark-producer` は維持します。
+### 7.7 テスト上の注意
 
-実行例：
-
-```bash
-kubectl apply -f k8s/benchmark-producer-job.yaml
-```
-
-```bash
-kubectl -n ai-mobility-poc wait \
-  --for=condition=complete \
-  job/benchmark-producer \
-  --timeout=180s
-```
-
-```bash
-kubectl -n ai-mobility-poc \
-  logs job/benchmark-producer
-```
-
-同じJobを再実行する場合は、Job名を変更するか、既存Jobを削除して再作成する必要があります。
-
-また、異なる負荷試験の結果が混ざらないよう、Run IDごとにジョブIDを分けています。
-
-### 7.6 テスト上の注意
-
-性能集計では、正常にACKされた対象Run IDのジョブのみを集計します。
-
-`completed_jobs` が期待件数と一致することを確認してから、p95・p99を比較します。
-
-ログ形式を変更すると解析スクリプトの正規表現が一致しなくなる可能性があるため、解析処理にもテストを設けています。
+- 正常ACKされた対象Run IDのジョブのみ分析する。
+- `completed_jobs` が期待件数と一致することを確認する。
+- 新旧ログ形式の互換性を維持する。
+- Worker詳細分析では計測値がすべて存在するジョブのみ対象とする。
+- MongoDB統計はサーバー全体の値として扱う。
+- 性能比較では測定条件を記録する。
+- Bash内Python集計処理の独立テストは今後の課題とする。
 
 ## 8. 制約と今後の課題
 
@@ -882,27 +1171,34 @@ kubectl -n ai-mobility-poc \
 
 ### 8.2 GPU対応
 
-- CPU推論を検証済み。
+- CPU推論は検証済み。
 - CUDA推論は未検証。
 - Kubernetes上のGPU割り当ては未検証。
 - CPU / GPU性能比較は未実施。
 
 ### 8.3 障害耐性
 
-- Worker停止からのPending再回収を検証済み。
-- MongoDB停止・復旧時の動作を検証済み。
-- 不正入力のDLQ隔離を検証済み。
-- 再試行上限超過の隔離を検証済み。
-- 指数バックオフは未実装。
-- DLQからの自動再投入は未実装。
-- Redis自体の障害復旧試験は未実施。
-- 複数ノード障害やネットワーク分断への耐性は未検証。
+検証済み：
+
+- Worker停止からのPending再回収
+- MongoDB停止・復旧後の再処理
+- 不正入力のDLQ隔離
+- 再試行上限超過時の隔離
+- 保存成功後のACK
+
+未検証・未実装：
+
+- 指数バックオフ
+- DLQからの自動再投入
+- Redis自体の長時間障害復旧
+- 複数ノード障害
+- ネットワーク分断への耐性
 
 ### 8.4 データ整合性
 
 MongoDB保存とRedis ACKは分散トランザクションではありません。
 
-MongoDBのupsertにより同じ `job_id` の重複ドキュメントは防止していますが、すべての副作用についてexactly-onceを保証するものではありません。
+upsertにより同一 `job_id` の重複ドキュメントは防止していますが、システム全体としてexactly-onceを保証するものではありません。
 
 ### 8.5 セキュリティ
 
@@ -910,57 +1206,86 @@ RedisとMongoDBはローカル学習用に認証なしで構成しています�
 
 共有環境や本番環境へそのまま配置しないでください。
 
-実運用では以下の検討が必要です。
+実運用では次の対策が必要です。
 
-- 認証と認可
-- 通信の暗号化
+- 認証・認可
+- TLSによる通信暗号化
 - Kubernetes Secret管理
 - ネットワーク制御
-- コンテナの権限管理
+- コンテナ権限管理
+- イメージの脆弱性管理
 
 ### 8.6 可観測性
 
-現在は標準出力ログによる計測が中心です。
+現在は標準出力ログとJSONレポートを中心に計測しています。
 
 未整備の項目：
 
 - JSON形式の構造化ログ
-- Prometheusなどへのメトリクス公開
+- Prometheusメトリクス
 - Grafanaダッシュボード
 - アラート通知
 - 分散トレーシング
 - 継続的なエラー率監視
+- 実行中のCPU・メモリ統計収集
 
 ### 8.7 性能評価
 
-100件のPipeline投入、E2E計測、p95・p99分析、バッチサイズ比較は実施済みです。
+実施済み：
+
+- 100件Pipeline投入
+- E2E p95 / p99分析
+- Queue待機時間の分解
+- バッチサイズ1と10の比較
+- Worker 1台・2台の反復比較
+- Worker内部処理時間の分解
+- MongoDB保存時間の詳細計測
+- MongoDB統計の前後差分取得
+- ベンチマーク自動化
 
 今後の課題：
 
-- `count=1` と `count=10` の複数回比較
+- バッチサイズ1と10の反復比較
 - ウォームアップ条件の統一
-- CPU・メモリ使用率の記録
-- Swap入出力の影響確認
+- Workerレプリカ比較の測定順序統制
+- CPU・メモリ・Swap使用量の同時記録
 - スループットの厳密な測定
-- Workerの複数レプリカ化
+- MongoDB保存遅延の原因分析
 - 高負荷時のエラー率測定
 - SLA / SLOに基づく性能判定
+- 現実的な推論モデルによる負荷試験
 
 ### 8.8 永続性と可用性
 
 RedisとMongoDBにはPVCを使用していますが、単一ノードkind構成です。
 
-バックアップ・リストア、複数ノード障害、データセンター障害への耐性は検証していません。
+バックアップ・リストア、複数ノード障害、データセンター障害に対する可用性は検証していません。
 
-### 8.9 今後の検証優先順位
+### 8.9 ベンチマーク実装の改善課題
 
-1. WSL2のメモリ・Swap使用状況の安定化
-2. バッチサイズ1と10の繰り返し比較
-3. 初回推論と通常処理の時間差の分析
-4. Workerの複数レプリカ化
-5. Pending・DLQ件数の監視
-6. 負荷試験の自動化
-7. CIによるpytest実行の自動化
+2026年10月21日のベンチマーク実行では、Bash内部のPython集計処理において、変数 `expected` の定義前参照による `NameError` が発生しました。
+
+Producer投入、Worker処理、MongoDB保存、JSONレポート生成は完了していたため、保存済みデータから `summary.csv` を復旧しました。
+
+今後の改善：
+
+1. Bash内部の集計処理を独立したPythonモジュールへ分離する。
+2. 単体テストで集計処理の成功・失敗条件を検証する。
+3. 中断したRunを安全に再集計できる機能を追加する。
+4. `summary.csv` への重複登録を防止する。
+5. ジョブID単位の重複・欠落を検出する。
+6. Pod再起動数・イメージ・リソース状態を保存する。
+
+### 8.10 今後の検証優先順位
+
+1. ベンチマーク集計処理のテスト強化
+2. WSL2リソース状態の計測
+3. MongoDB保存遅延の詳細分析
+4. Worker 1台・2台の再現性比較
+5. バッチサイズ1と10の反復比較
+6. Pending・DLQ件数の監視
+7. CIによるpytest自動実行
+8. 実モデルに近い推論処理の検証
 
 ## 9. ディレクトリ構成
 
@@ -985,15 +1310,22 @@ RedisとMongoDBにはPVCを使用していますが、単一ノードkind構成�
 │   ├── analyze_performance.py
 │   ├── analyze_e2e.py
 │   ├── analyze_dispatch.py
+│   ├── analyze_worker_breakdown.py
 │   ├── benchmark_producer.py
-│   └── run_benchmark.sh
+│   ├── run_benchmark.sh
+│   ├── run_replica_benchmark.sh
+│   └── mongodb/
+│       ├── collect_stats.js
+│       └── analyze_stats.py
 ├── tests/
 │   ├── __init__.py
 │   ├── test_inference.py
 │   ├── test_retry_policy.py
 │   ├── test_worker_retry.py
 │   ├── test_performance_metrics.py
-│   └── test_analyze_e2e.py
+│   ├── test_analyze_e2e.py
+│   ├── test_analyze_worker_breakdown.py
+│   └── test_metric_log_compatibility.py
 └── k8s/
     ├── namespace.yaml
     ├── redis.yaml
@@ -1003,31 +1335,35 @@ RedisとMongoDBにはPVCを使用していますが、単一ノードkind構成�
     └── benchmark-producer-job.yaml
 ```
 
-`output/` には性能測定時に取得したログ・JSONレポートなどを保存できます。
+`output/` にはベンチマーク時のログ・CSV・JSONレポートを保存します。
 
-実行環境固有のログや一時生成物については、必要に応じてGit管理対象から除外します。
+実行環境固有のログ、一時生成物、仮想環境、`__pycache__`、バックアップファイルなどは、必要に応じてGit管理対象から除外します。
 
 ---
 
 ## まとめ
 
-本PoCでは、Redis StreamsとPython / PyTorch、MongoDBを利用した非同期推論処理基盤を構築し、Docker ComposeおよびKubernetes上で動作検証を実施しました。
+本PoCでは、Redis Streams、Python / PyTorch、MongoDBを利用した非同期推論処理基盤を構築し、Docker ComposeおよびKubernetes上で段階的に検証しました。
 
-特に以下を確認しています。
+確認した主な機能は以下です。
 
 - Redis Streamsによる非同期ジョブ処理
-- MongoDB保存成功後のACK制御
-- Worker障害時のPendingジョブ再回収
+- MongoDB保存成功後のACK
+- Pendingジョブの再回収
 - MongoDB停止・復旧時の再処理
-- 再試行上限とDead Letter Streamへの隔離
-- 100件のPipeline投入と結果保存
-- Queue / Worker / E2Eレイテンシの測定
-- Redis取得前待機と取得後待機の分離
-- 取得バッチサイズ1と10の性能比較
-- pytest 27件成功
+- 再試行上限とDead Letter Stream
+- 100件のPipeline投入・結果保存
+- Queue / Worker / E2Eレイテンシ計測
+- Redis取得前・取得後待機の分離
+- 取得バッチサイズ1と10の比較
+- Worker 1台・2台の性能比較
+- Tensor生成・PyTorch推論・MongoDB保存時間の分解
+- MongoDB統計の収集・差分分析
+- ベンチマーク実行と結果保存の自動化
+- pytest 31件成功
 
-今回の性能検証では、**取得バッチサイズを1にするとWorker内部の取得後待機は短縮されるものの、E2E性能全体の改善には直結しない**ことが分かりました。
+Worker 2台構成ではE2E待機時間の短縮傾向が観測されましたが、測定環境の変動を十分に取り除けていないため、改善率の一般化には追加検証が必要です。
 
-したがって、現段階ではバッチサイズの最適値を確定せず、複数回測定による再現性の検証を今後の課題としています。
+また、MongoDB保存処理で100msを超える突発的な遅延が観測されましたが、その原因はまだ特定できていません。
 
-本リポジトリは、非同期処理・Kubernetesデプロイ・障害耐性・性能評価について、**設計、実装、実測、考察を段階的に積み重ねるための学習用PoC**です。
+**本リポジトリは、非同期処理・Kubernetes・障害耐性・性能評価について、設計、実装、実測、分析、改善を段階的に積み重ねるための学習用PoCです。**

@@ -133,12 +133,29 @@ def process_message(
     if delay > 0:
         time.sleep(delay)
 
+    # Tensor生成時間
+    tensor_started = time.perf_counter()
+
     image = torch.full(
         (1, 1, 16, 16),
         input_value,
     )
 
+    tensor_ms = (
+        time.perf_counter() - tensor_started
+    ) * 1000
+
+    # 推論実行時間
+    inference_started = time.perf_counter()
+
     score = worker.predict(image)[0]
+
+    inference_ms = (
+        time.perf_counter() - inference_started
+    ) * 1000
+
+    # MongoDB保存時間
+    mongo_started = time.perf_counter()
 
     # MongoDB保存が成功した場合のみACKする
     save_result(
@@ -148,6 +165,10 @@ def process_message(
         score=score,
         device=worker.device.type,
     )
+
+    mongo_save_ms = (
+        time.perf_counter() - mongo_started
+    ) * 1000
 
     saved_at = datetime.now(timezone.utc)
 
@@ -190,6 +211,9 @@ def process_message(
         f"e2e_ms={latencies['end_to_end_latency_ms']:.3f}, "
         f"redis_wait_ms={redis_wait_ms:.3f}, "
         f"dispatch_wait_ms={dispatch_wait_ms:.3f}, "
+        f"tensor_ms={tensor_ms:.3f}, "
+        f"inference_ms={inference_ms:.3f}, "
+        f"mongo_save_ms={mongo_save_ms:.3f}, "
         f"ack={acknowledged}",
         flush=True,
     )
