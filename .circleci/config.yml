@@ -121,8 +121,47 @@ jobs:
               ai-mobility-inference-poc:ci \
               -c "import torch; print('PyTorch:', torch.__version__)"
 
+  k8s-validate:
+    docker:
+      - image: cimg/base:stable
+
+    resource_class: small
+
+    steps:
+      - checkout
+
+      - run:
+          name: Install Kubeconform
+          command: |
+            set -euo pipefail
+
+            KUBECONFORM_VERSION="v0.6.3"
+
+            curl --fail --location --retry 3 \
+              "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+              -o /tmp/kubeconform.tar.gz
+
+            mkdir -p /tmp/kubeconform-bin
+
+            tar -xzf /tmp/kubeconform.tar.gz \
+              -C /tmp/kubeconform-bin kubeconform
+
+            /tmp/kubeconform-bin/kubeconform -v
+
+      - run:
+          name: Validate Kubernetes manifests
+          command: |
+            set -euo pipefail
+
+            /tmp/kubeconform-bin/kubeconform \
+              -strict \
+              -summary \
+              -kubernetes-version 1.37.0 \
+              k8s/
+
 workflows:
   ci:
     jobs:
       - test
       - docker-build
+      - k8s-validate
