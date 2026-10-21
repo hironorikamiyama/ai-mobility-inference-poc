@@ -113,6 +113,13 @@ jobs:
               ai-mobility-inference-poc:ci \
               --format 'Image size: {{.Size}} bytes'
 
+      - run:
+          name: Smoke test Docker image
+          command: |
+            docker run --rm \
+              --entrypoint python \
+              ai-mobility-inference-poc:ci \
+              -c "import torch; print('PyTorch:', torch.__version__)"
 
 workflows:
   ci:
