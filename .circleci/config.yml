@@ -4,7 +4,7 @@ version: 2.1
 jobs:
   test:
     docker:
-      - image: cimg/python:3.14
+      - image: cimg/python:3.14.8
 
     resource_class: medium
 
@@ -13,34 +13,51 @@ jobs:
 
       - run:
           name: Check Python version
-          command: python --version
+          command: |
+            python --version
 
       - restore_cache:
           keys:
-            - pip-v1-py314-{{ arch }}-{{ checksum "requirements.txt" }}
-            - pip-v1-py314-{{ arch }}-
+            - venv-v2-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
 
       - run:
-          name: Install dependencies
+          name: Prepare Python environment
           command: |
-            python -m pip install --upgrade pip
+            set -e
 
-            python -m pip install \
-              torch==2.14.1+cpu \
-              --index-url https://download.pytorch.org/whl/cpu
+            # キャッシュが復元できても、実行できない場合は再構築する
+            if [ -f .venv/.dependencies-ready ] && \
+               .venv/bin/python -c "import torch, numpy, redis, pymongo, pytest" && \
+               .venv/bin/python -m pip --version; then
+              echo "Using cached Python environment"
+            else
+              echo "Creating Python environment"
 
-            python -m pip install -r requirements.txt
-            python -m pip install pytest
+              rm -rf .venv
+              python -m venv .venv
+
+              .venv/bin/python -m pip install \
+                torch==2.14.1+cpu \
+                --index-url https://download.pytorch.org/whl/cpu
+
+              .venv/bin/python -m pip install \
+                -r requirements.txt pytest
+
+              touch .venv/.dependencies-ready
+            fi
+
+            .venv/bin/python --version
+            .venv/bin/python -m pytest --version
 
       - save_cache:
-          key: pip-v1-py314-{{ arch }}-{{ checksum "requirements.txt" }}
+          key: venv-v2-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
           paths:
-            - ~/.cache/pip
+            - .venv
 
       - run:
           name: Check Python syntax
           command: |
-            python -m compileall -q src scripts tests
+            .venv/bin/python -m compileall -q src scripts tests
 
       - run:
           name: Check Bash syntax
@@ -52,7 +69,7 @@ jobs:
           name: Run pytest
           command: |
             mkdir -p test-results
-            python -m pytest -q \
+            .venv/bin/python -m pytest -q \
               --junitxml=test-results/pytest.xml
 
       - store_test_results:
