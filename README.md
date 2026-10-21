@@ -1341,6 +1341,527 @@ Producer投入、Worker処理、MongoDB保存、JSONレポート生成は完了�
 
 ---
 
+
+## 10. CircleCIによるCI自動化と高速化（Phase 9）
+
+2026年10月21日、GitHubとCircleCIを連携し、Pythonアプリケーションの継続的インテグレーション（CI）環境を構築しました。
+
+本Phaseでは、GitHubへのpushを契機として、依存ライブラリの準備、ソースコードの構文チェック、pytestの実行、JUnit XMLレポートの保存を自動化しています。
+
+さらに、PyTorchを含むPython仮想環境をキャッシュすることで、CIの実行時間短縮を検証しました。
+
+### 10.1 CI導入の目的
+
+本PoCでは、Redis Streams、PyTorch、MongoDB、Kubernetesを組み合わせた非同期推論処理基盤を実装しています。
+
+機能追加に伴ってテストや計測処理も増加したため、ローカル環境での手動テストだけに依存しない開発体制を整えることを目的としました。
+
+主な目標は以下のとおりです。
+
+- GitHubへのpush時に自動でテストを実行する。
+- Python 3.14環境で依存ライブラリを再現する。
+- Python・Bashの構文チェックを自動化する。
+- 既存のpytest 31件を自動実行する。
+- JUnit XML形式のテストレポートを保存する。
+- 依存ライブラリの再インストールを削減する。
+- CIの実行時間を計測して改善効果を確認する。
+
+### 10.2 CIの実行フロー
+
+```mermaid
+flowchart TD
+    A[GitHubへpush]
+    B[CircleCI Pipeline起動]
+    C[リポジトリをcheckout]
+    D[Python環境の確認]
+    E[仮想環境キャッシュの復元]
+    F{キャッシュは利用可能か}
+    G[仮想環境を再利用]
+    H[仮想環境の作成・依存関係インストール]
+    I[キャッシュ保存]
+    J[Python構文チェック]
+    K[Bash構文チェック]
+    L[pytest実行]
+    M[JUnit XML生成]
+    N[テスト結果・Artifacts保存]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F -->|Yes| G
+    F -->|No| H
+    H --> I
+    G --> I
+    I --> J
+    J --> K
+    K --> L
+    L --> M
+    M --> N
+```
+
+本Phaseでは、Redis・MongoDB・Kubernetesを起動する統合試験はCIに含めていません。
+
+まずは、アプリケーションの単体テストとコード検証を安定して実行することを優先しました。
+
+### 10.3 CircleCIの基本構成
+
+CircleCI設定ファイルは以下です。
+
+```text
+.circleci/config.yml
+```
+
+主な実行条件：
+
+| 項目 | 設定 |
+| --- | --- |
+| CIサービス | CircleCI |
+| ソースコード管理 | GitHub |
+| トリガー | GitHubへのpush |
+| Executor | Docker |
+| Dockerイメージ | `cimg/python:3.14.8` |
+| Resource Class | `medium` |
+| Python | 3.14.8 |
+| PyTorch | 2.14.1+cpu |
+| テストフレームワーク | pytest |
+| テストレポート | JUnit XML |
+| キャッシュ対象 | Python仮想環境 `.venv` |
+
+2026年10月21日の検証では、`main` ブランチで正常にパイプラインが実行されることを確認しました。
+
+### 10.4 PyTorch CPU版の依存関係解決
+
+CircleCI導入時、最初のパイプラインは依存関係のインストール段階で失敗しました。
+
+発生したエラー：
+
+```text
+ERROR: Could not find a version that satisfies
+the requirement torch==2.14.1+cpu
+
+ERROR: No matching distribution found for torch==2.14.1+cpu
+```
+
+原因は、通常のPyPIインデックスから `torch==2.14.1+cpu` を取得できなかったことです。
+
+これに対して、PyTorch CPU版の専用インデックスを明示してインストールする方式へ変更しました。
+
+```bash
+python -m pip install \
+  torch==2.14.1+cpu \
+  --index-url https://download.pytorch.org/whl/cpu
+```
+
+その後、`requirements.txt` とpytestをインストールします。
+
+```bash
+python -m pip install -r requirements.txt pytest
+```
+
+この修正により、CircleCI上で依存関係を解決できるようになりました。
+
+修正後のパイプラインでは、pytest 31件すべてが成功しました。
+
+### 10.5 pytestの自動実行
+
+CircleCIでは、以下の処理を自動実行します。
+
+Python構文チェック：
+
+```bash
+python -m compileall -q src scripts tests
+```
+
+Bash構文チェック：
+
+```bash
+bash -n scripts/run_replica_benchmark.sh
+bash -n scripts/run_benchmark.sh
+```
+
+pytest：
+
+```bash
+python -m pytest -q
+```
+
+初回のCI成功時には、以下の結果を確認しました。
+
+```text
+31 passed in 1.66s
+```
+
+これにより、ローカル環境とは独立したCircleCI実行環境でも、既存のテストがすべて成功することを確認できました。
+
+### 10.6 JUnit XML形式のテストレポート
+
+テスト実行結果をCircleCI上で確認できるように、JUnit XML形式のレポート出力を追加しました。
+
+設定例：
+
+```yaml
+- run:
+    name: Run pytest
+    command: |
+      mkdir -p test-results
+      .venv/bin/python -m pytest -q \
+        --junitxml=test-results/pytest.xml
+
+- store_test_results:
+    path: test-results
+
+- store_artifacts:
+    path: test-results
+```
+
+生成ファイル：
+
+```text
+test-results/pytest.xml
+```
+
+実行結果：
+
+| 指標 | 結果 |
+| --- | ---: |
+| テスト件数 | 31 |
+| 失敗 | 0 |
+| エラー | 0 |
+| スキップ | 0 |
+| pytest実行時間 | 約1.93秒 |
+
+JUnit XMLにはテストケース名、実行時間、失敗・エラー情報が記録されます。
+
+CircleCIのArtifactsタブから `pytest.xml` を確認できることを検証しました。
+
+なお、XMLをブラウザで直接開いた際にスタイルシートが存在しない旨が表示されることがありますが、JUnit XML自体のエラーではありません。
+
+### 10.7 pipキャッシュ方式の検証
+
+当初は、pipのダウンロードキャッシュをCircleCIに保存する方式を試しました。
+
+キャッシュ対象：
+
+```text
+/home/circleci/.cache/pip
+```
+
+使用したCircleCI機能：
+
+```yaml
+- restore_cache:
+    keys:
+      - pip-v1-py314-{{ arch }}-{{ checksum "requirements.txt" }}
+
+- save_cache:
+    key: pip-v1-py314-{{ arch }}-{{ checksum "requirements.txt" }}
+    paths:
+      - ~/.cache/pip
+```
+
+検証結果：
+
+| 項目 | 結果 |
+| --- | --- |
+| キャッシュ保存 | 成功 |
+| キャッシュ復元 | 成功 |
+| キャッシュ容量 | 238MiB |
+| Cache Miss時の実行時間 | 47秒 |
+| Cache Hit時の実行時間 | 71秒 |
+
+pipのキャッシュは正常に再利用されていました。
+
+しかし、キャッシュからパッケージを取得できても、ライブラリのインストール処理自体は毎回発生しました。
+
+この測定では、Cache Hit後のジョブ実行時間は短縮しませんでした。
+
+ただし、各実行時のネットワークやホスト負荷を統制できていないため、pipキャッシュそのものが遅延の原因であるとは断定していません。
+
+### 10.8 Python仮想環境キャッシュへの変更
+
+次に、pipのダウンロードキャッシュから、インストール済みPython仮想環境を再利用する方式へ変更しました。
+
+キャッシュ対象：
+
+```text
+/home/circleci/project/.venv
+```
+
+主なキャッシュキー：
+
+```yaml
+- restore_cache:
+    keys:
+      - venv-v2-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
+```
+
+キャッシュ保存：
+
+```yaml
+- save_cache:
+    key: venv-v2-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
+    paths:
+      - .venv
+```
+
+キャッシュキーには以下の情報を含めています。
+
+- キャッシュ定義のバージョン
+- Pythonバージョン
+- PyTorchバージョン
+- 実行環境のアーキテクチャ
+- `requirements.txt` のチェックサム
+
+同一条件でキャッシュを復元できた場合は、依存ライブラリの再インストールを省略します。
+
+### 10.9 仮想環境の再利用判定
+
+キャッシュを復元できても、仮想環境が正常に動作するとは限りません。
+
+そのため、マーカーファイルの存在に加えて、必要なライブラリのimportとpipの起動を確認する方式にしました。
+
+```bash
+if [ -f .venv/.dependencies-ready ] && \
+   .venv/bin/python -c "import torch, numpy, redis, pymongo, pytest" && \
+   .venv/bin/python -m pip --version; then
+
+  echo "Using cached Python environment"
+
+else
+  echo "Creating Python environment"
+
+  rm -rf .venv
+  python -m venv .venv
+
+  .venv/bin/python -m pip install \
+    torch==2.14.1+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+
+  .venv/bin/python -m pip install \
+    -r requirements.txt pytest
+
+  touch .venv/.dependencies-ready
+fi
+```
+
+再実行時には、以下のログを確認しました。
+
+```text
+Using cached Python environment
+Python 3.14.8
+pytest 9.1.1
+```
+
+これによって、仮想環境の復元後にライブラリを再インストールせず、テスト環境を再利用できたことを確認しました。
+
+ただし、importの成功だけで依存関係の完全な整合性を保証するものではありません。
+
+Dockerイメージの変更や依存関係の更新時には、キャッシュキーの見直しが必要です。
+
+### 10.10 CI高速化の測定結果
+
+2026年10月21日の実測値を以下に示します。
+
+| キャッシュ方式 | 条件 | ジョブ実行時間 |
+| --- | --- | ---: |
+| キャッシュなし | 初期CI | 56秒 |
+| pipキャッシュ | Cache Miss | 47秒 |
+| pipキャッシュ | Cache Hit | 71秒 |
+| 仮想環境キャッシュ | Cache Miss | 80秒 |
+| 仮想環境キャッシュ | Cache Hit | **39秒** |
+
+仮想環境キャッシュの初回実行では、依存ライブラリのインストールとキャッシュ保存に時間がかかりました。
+
+一方、同じキャッシュを利用した再実行では39秒で完了しました。
+
+同一方式の初回実行と再利用時を比較すると、次のようになります。
+
+```text
+仮想環境キャッシュ初回 : 80秒
+仮想環境キャッシュ再利用 : 39秒
+
+短縮時間 : 41秒
+短縮率   : 約51.3%
+```
+
+キャッシュを使用しない初期CIの56秒と比較した場合は、17秒の短縮です。
+
+ただし、測定回数が少なく、実行環境の変動も含まれるため、これらの数値は参考値です。
+
+### 10.11 キャッシュ再利用時の詳細
+
+仮想環境キャッシュ再利用時の結果：
+
+| 項目 | 結果 |
+| --- | --- |
+| CircleCIジョブ | Success |
+| ジョブ実行時間 | 39秒 |
+| キャッシュ復元 | 成功 |
+| Restoring cache | 5秒 |
+| キャッシュ容量 | 228MiB |
+| Prepare Python environment | 4秒 |
+| 依存ライブラリの再インストール | 省略 |
+| Saving cache | 既存キャッシュのためスキップ |
+
+ログ：
+
+```text
+Found a cache from job 7
+Size: 228 MiB
+
+Using cached Python environment
+Python 3.14.8
+pytest 9.1.1
+```
+
+キャッシュ保存時には以下のログも確認しました。
+
+```text
+Skipping cache generation,
+cache already exists for key...
+```
+
+これは、同一キーのキャッシュがすでに存在するため、再保存を行わないという意味です。
+
+### 10.12 最終的なCircleCI設定
+
+2026年10月21日時点で使用した設定例です。
+
+```yaml
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      - image: cimg/python:3.14.8
+
+    resource_class: medium
+
+    steps:
+      - checkout
+
+      - run:
+          name: Check Python version
+          command: |
+            python --version
+
+      - restore_cache:
+          keys:
+            - venv-v2-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
+
+      - run:
+          name: Prepare Python environment
+          command: |
+            set -e
+
+            if [ -f .venv/.dependencies-ready ] && \
+               .venv/bin/python -c "import torch, numpy, redis, pymongo, pytest" && \
+               .venv/bin/python -m pip --version; then
+              echo "Using cached Python environment"
+            else
+              echo "Creating Python environment"
+
+              rm -rf .venv
+              python -m venv .venv
+
+              .venv/bin/python -m pip install \
+                torch==2.14.1+cpu \
+                --index-url https://download.pytorch.org/whl/cpu
+
+              .venv/bin/python -m pip install \
+                -r requirements.txt pytest
+
+              touch .venv/.dependencies-ready
+            fi
+
+            .venv/bin/python --version
+            .venv/bin/python -m pytest --version
+
+      - save_cache:
+          key: venv-v2-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
+          paths:
+            - .venv
+
+      - run:
+          name: Check Python syntax
+          command: |
+            .venv/bin/python -m compileall -q src scripts tests
+
+      - run:
+          name: Check Bash syntax
+          command: |
+            bash -n scripts/run_replica_benchmark.sh
+            bash -n scripts/run_benchmark.sh
+
+      - run:
+          name: Run pytest
+          command: |
+            mkdir -p test-results
+            .venv/bin/python -m pytest -q \
+              --junitxml=test-results/pytest.xml
+
+      - store_test_results:
+          path: test-results
+
+      - store_artifacts:
+          path: test-results
+
+workflows:
+  ci:
+    jobs:
+      - test
+```
+
+実際に使用する設定は、リポジトリ内の `.circleci/config.yml` を正本とします。
+
+### 10.13 Phase 9の検証結果
+
+本Phaseでは以下の項目を検証しました。
+
+| 検証項目 | 結果 |
+| --- | --- |
+| GitHubとCircleCIの連携 | 成功 |
+| GitHub pushによるCI起動 | 成功 |
+| Python 3.14環境の構築 | 成功 |
+| PyTorch CPU版のインストール | 成功 |
+| Python構文チェック | 成功 |
+| Bash構文チェック | 成功 |
+| pytest 31件 | 成功 |
+| JUnit XML生成 | 成功 |
+| Artifacts保存 | 成功 |
+| pipキャッシュの保存・復元 | 成功 |
+| 仮想環境キャッシュの保存・復元 | 成功 |
+| 仮想環境の再インストール省略 | 確認 |
+| 仮想環境キャッシュによる高速化 | 観測 |
+
+**Phase 9の目標であるCI自動化、テスト結果の保存、キャッシュ再利用による高速化は達成しました。**
+
+### 10.14 今後の改善課題
+
+今回構築したCIは、Python単体テストを中心とした最小構成です。
+
+今後の課題は以下のとおりです。
+
+1. キャッシュ再利用時の実行時間を複数回測定し、効果の再現性を確認する。
+2. Dockerイメージの更新とキャッシュの整合性を管理する。
+3. Python依存関係のバージョン固定を強化する。
+4. DockerイメージのビルドをCIに追加する。
+5. Kubernetesマニフェストの構文・スキーマ検証を追加する。
+6. Redis・MongoDBを使用する統合テストを追加する。
+7. テストカバレッジを計測する。
+8. Pull Request時のチェックとブランチ保護を整備する。
+9. 必要に応じて脆弱性スキャンを導入する。
+10. CIからのCD（継続的デリバリー／デプロイ）を検討する。
+
+特に次の段階では、**CircleCI上でDockerイメージをビルドし、Kubernetesへ適用する前に成果物を検証する仕組み**を構築することを候補としています。
+
+ただし、本PoCは単一ノードkindによるローカル学習環境であり、現時点で本番環境への自動デプロイは目的としていません。
+
+---
+
+
 ## まとめ
 
 本PoCでは、Redis Streams、Python / PyTorch、MongoDBを利用した非同期推論処理基盤を構築し、Docker ComposeおよびKubernetes上で段階的に検証しました。
@@ -1367,3 +1888,14 @@ Worker 2台構成ではE2E待機時間の短縮傾向が観測されましたが
 また、MongoDB保存処理で100msを超える突発的な遅延が観測されましたが、その原因はまだ特定できていません。
 
 **本リポジトリは、非同期処理・Kubernetes・障害耐性・性能評価について、設計、実装、実測、分析、改善を段階的に積み重ねるための学習用PoCです。**
+
+
+CircleCIの導入によって、これまでローカル環境で実施していたPython単体テストと構文チェックを、GitHubへのpushに連動して自動実行できるようになりました。
+
+また、JUnit XML形式のテストレポートを保存し、CIの実行結果を継続的に確認できる環境を整備しました。
+
+依存ライブラリのキャッシュ方式については、pipキャッシュとPython仮想環境キャッシュを比較しました。
+
+今回の測定では、仮想環境キャッシュの再利用時にジョブ実行時間が39秒となり、初回実行の80秒から41秒短縮しました。
+
+**CIを構築するだけでなく、実際のログと計測値を基に実行方式を改善し、その効果を検証しました。**
