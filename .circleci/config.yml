@@ -167,7 +167,7 @@ jobs:
           REDIS_URL: redis://localhost:6379/0
           MONGO_URI: mongodb://localhost:27017/
       - image: redis:7
-      - image: mongo:8
+      - image: mongo:7.0
 
     resource_class: medium
 
