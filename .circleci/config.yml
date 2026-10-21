@@ -69,7 +69,8 @@ jobs:
           name: Run pytest
           command: |
             mkdir -p test-results
-            .venv/bin/python -m pytest -q \
+            .venv/bin/python -m pytest -q tests \
+              --ignore=tests/integration \
               --junitxml=test-results/pytest.xml
 
       - store_test_results:
@@ -159,9 +160,70 @@ jobs:
               -kubernetes-version 1.37.0 \
               k8s/
 
+  integration-test:
+    docker:
+      - image: cimg/python:3.14.8
+        environment:
+          REDIS_URL: redis://localhost:6379/0
+          MONGO_URI: mongodb://localhost:27017/
+      - image: redis:7
+      - image: mongo:8
+
+    resource_class: medium
+
+    steps:
+      - checkout
+
+      - run:
+          name: Install integration dependencies
+          command: |
+            python -m pip install \
+              "redis>=6,<7" \
+              "pymongo>=4,<5" \
+              pytest
+
+      - run:
+          name: Wait for Redis and MongoDB
+          command: |
+            python - <<'PY'
+            import time
+            from pymongo import MongoClient
+            from redis import Redis
+
+            for attempt in range(60):
+                try:
+                    redis = Redis(host="localhost", port=6379)
+                    mongo = MongoClient(
+                        "mongodb://localhost:27017/",
+                        serverSelectionTimeoutMS=1000,
+                    )
+                    assert redis.ping()
+                    mongo.admin.command("ping")
+                    print("Redis and MongoDB are ready")
+                    break
+                except Exception:
+                    if attempt == 59:
+                        raise
+                    time.sleep(1)
+            PY
+
+      - run:
+          name: Run integration tests
+          command: |
+            mkdir -p test-results
+            python -m pytest -q tests/integration \
+              --junitxml=test-results/integration.xml
+
+      - store_test_results:
+          path: test-results
+
+      - store_artifacts:
+          path: test-results
+
 workflows:
   ci:
     jobs:
       - test
       - docker-build
       - k8s-validate
+      - integration-test
