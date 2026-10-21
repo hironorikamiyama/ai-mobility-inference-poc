@@ -1,0 +1,43 @@
+version: 2.1
+
+jobs:
+  test:
+    docker:
+      - image: cimg/python:3.14
+
+    resource_class: medium
+
+    steps:
+      - checkout
+
+      - run:
+          name: Check Python version
+          command: python --version
+
+      - run:
+          name: Install dependencies
+          command: |
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements.txt
+            python -m pip install pytest
+
+      - run:
+          name: Check Python syntax
+          command: |
+            python -m compileall -q src scripts tests
+
+      - run:
+          name: Check Bash syntax
+          command: |
+            bash -n scripts/run_replica_benchmark.sh
+            bash -n scripts/run_benchmark.sh
+
+      - run:
+          name: Run pytest
+          command: |
+            python -m pytest -q
+
+workflows:
+  ci:
+    jobs:
+      - test
