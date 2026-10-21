@@ -78,7 +78,44 @@ jobs:
       - store_artifacts:
           path: test-results
 
+  docker-build:
+    docker:
+      - image: cimg/base:stable
+
+    resource_class: medium
+
+    steps:
+      - checkout
+
+      - setup_remote_docker
+
+      - run:
+          name: Check Docker environment
+          command: |
+            docker version
+            docker info
+
+      - run:
+          name: Build inference worker image
+          command: |
+            docker build \
+              --tag ai-mobility-inference-poc:ci \
+              .
+
+      - run:
+          name: Verify Docker image
+          command: |
+            docker image inspect \
+              ai-mobility-inference-poc:ci \
+              --format 'Image ID: {{.Id}}'
+
+            docker image inspect \
+              ai-mobility-inference-poc:ci \
+              --format 'Image size: {{.Size}} bytes'
+
+
 workflows:
   ci:
     jobs:
       - test
+      - docker-build
