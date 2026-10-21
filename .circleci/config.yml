@@ -43,7 +43,15 @@ jobs:
       - run:
           name: Run pytest
           command: |
-            python -m pytest -q
+            mkdir -p test-results
+            python -m pytest -q \
+              --junitxml=test-results/pytest.xml
+
+      - store_test_results:
+          path: test-results
+
+      - store_artifacts:
+          path: test-results
 
 workflows:
   ci:
