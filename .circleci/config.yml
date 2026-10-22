@@ -244,6 +244,7 @@ jobs:
           command: |
             mkdir -p test-results
             .venv/bin/python -m pytest -q tests/integration \
+              --durations=10 \
               --junitxml=test-results/integration.xml
 
       - store_test_results:
