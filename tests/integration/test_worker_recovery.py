@@ -12,7 +12,6 @@ from redis.exceptions import ResponseError
 
 STREAM = "inference_jobs"
 GROUP = "inference_workers"
-RECLAIM_IDLE_MS = 30_000
 
 
 def test_worker_reclaims_pending_message():
@@ -107,6 +106,7 @@ def test_worker_reclaims_pending_message():
         env["OMP_NUM_THREADS"] = "1"
         env["MKL_NUM_THREADS"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
+        env["RECLAIM_IDLE_MS"] = "1000"
 
         worker_process = subprocess.Popen(
             [sys.executable, "-m", "src.worker"],
@@ -116,7 +116,7 @@ def test_worker_reclaims_pending_message():
         )
 
         # 30秒のアイドル期間を含めて再回収を待機
-        deadline = time.monotonic() + 80
+        deadline = time.monotonic() + 20
 
         while time.monotonic() < deadline:
             if worker_process.poll() is not None:

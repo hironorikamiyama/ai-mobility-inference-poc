@@ -43,6 +43,7 @@ def start_worker(consumer, mongo_uri, log_file):
         "MKL_NUM_THREADS": "1",
         "PYTHONUNBUFFERED": "1",
         "WORKER_PROCESSING_DELAY_SECONDS": "0",
+        "RECLAIM_IDLE_MS": "1000",
     })
 
     return subprocess.Popen(
@@ -178,7 +179,7 @@ def test_mongodb_recovery_reprocesses_pending():
         wait_until_started(worker_b, log_b)
 
         # 6. 30秒の再回収条件を含めて処理完了を待つ
-        deadline = time.monotonic() + 80
+        deadline = time.monotonic() + 20
 
         while time.monotonic() < deadline:
             if worker_b.poll() is not None:

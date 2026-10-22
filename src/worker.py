@@ -19,8 +19,9 @@ from src.retry_policy import (
 STREAM_NAME = "inference_jobs"
 GROUP_NAME = "inference_workers"
 DEAD_LETTER_STREAM = "inference_jobs_dead"
-RECLAIM_IDLE_MS = 30_000
-
+RECLAIM_IDLE_MS = int(
+    os.getenv("RECLAIM_IDLE_MS", "30000")
+)
 
 def create_group(client):
     try:
