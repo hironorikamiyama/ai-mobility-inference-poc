@@ -14,66 +14,6 @@ STREAM = "inference_jobs"
 GROUP = "inference_workers"
 
 
-def read_log(log_file):
-    log_file.flush()
-    log_file.seek(0)
-    return log_file.read()
-
-
-def stop_worker(process):
-    if process is None or process.poll() is not None:
-        return
-
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
-
-
-def start_worker(
-    consumer,
-    mongo_uri,
-    log_file,
-    reclaim_idle_ms=30000,
-):
-    env = os.environ.copy()
-    env.update({
-        "REDIS_HOST": os.getenv("REDIS_HOST", "localhost"),
-        "MONGO_URI": mongo_uri,
-        "CONSUMER_NAME": consumer,
-        "READ_BATCH_SIZE": "1",
-        "OMP_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "PYTHONUNBUFFERED": "1",
-        "WORKER_PROCESSING_DELAY_SECONDS": "0",
-        "RECLAIM_IDLE_MS": str(reclaim_idle_ms),
-    })
-
-    return subprocess.Popen(
-        [sys.executable, "-m", "src.worker"],
-        env=env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-    )
-
-
-def wait_until_started(process, log_file, timeout=30):
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError("Worker exited during startup")
-
-        if "Worker started:" in read_log(log_file):
-            return
-
-        time.sleep(0.2)
-
-    raise TimeoutError("Worker startup timed out")
-
-
 def test_mongodb_recovery_reprocesses_pending(
     worker_processes,
 ):
@@ -102,9 +42,6 @@ def test_mongodb_recovery_reprocesses_pending(
     worker_a = None
     worker_b = None
     message_id = None
-
-    log_a = tempfile.TemporaryFile(mode="w+t")
-    log_b = tempfile.TemporaryFile(mode="w+t")
 
     try:
         assert redis_client.ping()
@@ -268,5 +205,3 @@ def test_mongodb_recovery_reprocesses_pending(
 
         mongo_client.close()
         redis_client.close()
-        log_a.close()
-        log_b.close()
