@@ -1,7 +1,5 @@
 import os
-import subprocess
 import sys
-import tempfile
 import time
 import uuid
 
@@ -27,20 +25,7 @@ def get_pending(redis_client, message_id):
     )
 
 
-def stop_worker(process):
-    if process is None or process.poll() is not None:
-        return
-
-    process.terminate()
-
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
-
-
-def test_retry_exhaustion_moves_job_to_dlq():
+def test_retry_exhaustion_moves_job_to_dlq(worker_processes):
     suffix = uuid.uuid4().hex
     job_id = f"ci-dlq-{suffix}"
     initial_consumer = f"ci-dlq-initial-{suffix}"
@@ -53,20 +38,20 @@ def test_retry_exhaustion_moves_job_to_dlq():
         socket_connect_timeout=3,
     )
 
-    mongo_client = MongoClient(
-        os.getenv(
-            "MONGO_URI",
-            "mongodb://localhost:27017/",
-        ),
-        serverSelectionTimeoutMS=3000,
+    mongo_uri = os.getenv(
+        "MONGO_URI",
+        "mongodb://localhost:27017/",
     )
 
+    mongo_client = MongoClient(
+        mongo_uri,
+        serverSelectionTimeoutMS=3000,
+    )
     collection = mongo_client["ai_mobility"]["inference_results"]
 
-    worker_process = None
+    worker = None
     message_id = None
     dlq_message_id = None
-    worker_log = tempfile.TemporaryFile(mode="w+t")
 
     try:
         assert redis_client.ping()
@@ -83,7 +68,6 @@ def test_retry_exhaustion_moves_job_to_dlq():
         assert len(thresholds) == 1, (
             "Unexpected retry policy threshold"
         )
-
         threshold = thresholds[0]
 
         print(
@@ -91,6 +75,7 @@ def test_retry_exhaustion_moves_job_to_dlq():
             flush=True,
         )
 
+        # Consumer Groupを準備
         try:
             redis_client.xgroup_create(
                 STREAM,
@@ -102,7 +87,7 @@ def test_retry_exhaustion_moves_job_to_dlq():
             if "BUSYGROUP" not in str(exc):
                 raise
 
-        # 1. ジョブ投入
+        # 1. Redis Streamsへジョブを投入
         message_id = redis_client.xadd(
             STREAM,
             {
@@ -111,7 +96,7 @@ def test_retry_exhaustion_moves_job_to_dlq():
             },
         )
 
-        # 2. Consumerが受信してPendingにする
+        # 2. 初期Consumerが取得してPendingにする
         messages = redis_client.xreadgroup(
             GROUP,
             initial_consumer,
@@ -123,9 +108,8 @@ def test_retry_exhaustion_moves_job_to_dlq():
         assert messages
         assert messages[0][1][0][0] == message_id
 
-        # 3. 再試行上限の直前をRedisで再現
-        # XCLAIMのRETRYCOUNTで配信回数を設定し、
-        # IDLEで30秒以上経過した状態にする。
+        # 3. XCLAIMで再試行上限直前の状態を再現
+        # WorkerのXAUTOCLAIMで配信回数を上限に到達させる
         claimed = redis_client.execute_command(
             "XCLAIM",
             STREAM,
@@ -142,54 +126,37 @@ def test_retry_exhaustion_moves_job_to_dlq():
         assert claimed
 
         pending = get_pending(redis_client, message_id)
-
         assert len(pending) == 1
         assert pending[0]["times_delivered"] == threshold - 1
 
-        # 4. 実際のWorkerを起動
-        env = os.environ.copy()
-        env.update({
-            "REDIS_HOST": os.getenv(
-                "REDIS_HOST", "localhost"
-            ),
-            "MONGO_URI": os.getenv(
-                "MONGO_URI",
-                "mongodb://localhost:27017/",
-            ),
-            "CONSUMER_NAME": worker_consumer,
-            "READ_BATCH_SIZE": "1",
-            "OMP_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "PYTHONUNBUFFERED": "1",
-            "WORKER_PROCESSING_DELAY_SECONDS": "0",
-        })
-
-        worker_process = subprocess.Popen(
-            [sys.executable, "-m", "src.worker"],
-            env=env,
-            stdout=worker_log,
-            stderr=subprocess.STDOUT,
+        # 4. 共通fixtureで実際のWorkerを起動
+        worker = worker_processes(
+            consumer=worker_consumer,
+            mongo_uri=mongo_uri,
+            # DLQ検証では事前にIDLEを設定済み
+            reclaim_idle_ms=30000,
         )
 
-        # 5. Workerが再回収してDLQに隔離するまで待つ
+        worker.wait_until_started()
+
+        # 5. DLQ記録と元メッセージACKを確認
         deadline = time.monotonic() + 45
 
         while time.monotonic() < deadline:
-            if worker_process.poll() is not None:
+            if worker.process.poll() is not None:
                 raise RuntimeError(
-                    "Worker exited unexpectedly"
+                    "Worker exited unexpectedly:\n"
+                    + worker.read_log()
                 )
 
-            worker_log.flush()
-            worker_log.seek(0)
-            logs = worker_log.read()
+            logs = worker.read_log()
 
             dlq_entries = redis_client.xrange(DLQ)
 
             matches = [
                 (entry_id, fields)
                 for entry_id, fields in dlq_entries
-                if message_id in fields.values()
+                if fields.get("original_stream_id") == message_id
             ]
 
             pending = get_pending(redis_client, message_id)
@@ -197,17 +164,14 @@ def test_retry_exhaustion_moves_job_to_dlq():
             if (
                 matches
                 and not pending
-                and f"Retry exhausted: stream_id={message_id}"
-                in logs
+                and f"Retry exhausted: stream_id={message_id}" in logs
             ):
                 assert len(matches) == 1
 
                 dlq_message_id, dlq_record = matches[0]
 
                 assert dlq_record
-                assert collection.find_one(
-                    {"_id": job_id}
-                ) is None
+                assert collection.find_one({"_id": job_id}) is None
 
                 print(
                     "DLQ isolation succeeded",
@@ -228,40 +192,32 @@ def test_retry_exhaustion_moves_job_to_dlq():
         # 6. 元ジョブはPendingから消えている
         assert not get_pending(redis_client, message_id)
 
-        # 7. MongoDBには推論結果が存在しない
-        assert collection.count_documents(
-            {"_id": job_id}
-        ) == 0
+        # 7. MongoDBに推論結果が存在しない
+        assert collection.count_documents({"_id": job_id}) == 0
 
     finally:
-        stop_worker(worker_process)
+        # Redisの後片付けより先にWorkerを停止
+        if worker is not None:
+            worker.stop()
 
-        worker_log.flush()
-        worker_log.seek(0)
-
-        if sys.exc_info()[0] is not None:
+        if sys.exc_info()[0] is not None and worker is not None:
             print(
                 "\n=== Worker log ===\n"
-                + worker_log.read(),
+                + worker.read_log(),
                 file=sys.stderr,
             )
 
-        # テストで作成したデータのみ削除
+        # テストが作成したメッセージのみ削除
         if message_id is not None:
-            redis_client.xack(
-                STREAM, GROUP, message_id
-            )
-            redis_client.xdel(
-                STREAM, message_id
-            )
+            redis_client.xack(STREAM, GROUP, message_id)
+            redis_client.xdel(STREAM, message_id)
 
         if dlq_message_id is not None:
-            redis_client.xdel(
-                DLQ, dlq_message_id
-            )
+            redis_client.xdel(DLQ, dlq_message_id)
 
         collection.delete_one({"_id": job_id})
 
         mongo_client.close()
         redis_client.close()
-        worker_log.close()
+
+        # ログファイルのcloseはfixtureが担当
