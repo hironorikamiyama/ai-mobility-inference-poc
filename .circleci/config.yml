@@ -174,22 +174,49 @@ jobs:
     steps:
       - checkout
 
-      - run:
-          name: Install integration dependencies
-          command: |
-            python -m pip install \
-              torch==2.14.1+cpu \
-              --index-url https://download.pytorch.org/whl/cpu
+      - restore_cache:
+          keys:
+            - integration-venv-v1-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
 
-            python -m pip install \
-              "redis>=6,<7" \
-              "pymongo>=4,<5" \
-              pytest
+      - run:
+          name: Prepare integration environment
+          command: |
+            set -e
+
+            if [ -f .venv/.integration-ready ] && \
+               .venv/bin/python -c "import torch, redis, pymongo, pytest" && \
+               .venv/bin/python -m pip --version; then
+              echo "Using cached integration environment"
+            else
+              echo "Creating integration environment"
+
+              rm -rf .venv
+              python -m venv .venv
+
+              .venv/bin/python -m pip install \
+                torch==2.14.1+cpu \
+                --index-url https://download.pytorch.org/whl/cpu
+
+              .venv/bin/python -m pip install \
+                "redis>=6,<7" \
+                "pymongo>=4,<5" \
+                pytest
+
+              touch .venv/.integration-ready
+            fi
+
+            .venv/bin/python --version
+            .venv/bin/python -m pytest --version
+
+      - save_cache:
+          key: integration-venv-v1-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
+          paths:
+            - .venv
 
       - run:
           name: Wait for Redis and MongoDB
           command: |
-            python - \<<'PY'
+            .venv/bin/python - \<<'PY'
             import time
             from pymongo import MongoClient
             from redis import Redis
@@ -215,7 +242,7 @@ jobs:
           name: Run integration tests
           command: |
             mkdir -p test-results
-            python -m pytest -q tests/integration \
+            .venv/bin/python -m pytest -q tests/integration \
               --junitxml=test-results/integration.xml
 
       - store_test_results:
