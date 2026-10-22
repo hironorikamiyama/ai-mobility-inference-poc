@@ -2538,3 +2538,564 @@ Redis・MongoDBのサービス連携テスト
 **本PoCでは、GitHubへのpushを契機として、Pythonコード、Dockerイメージ、Kubernetes定義、およびRedis・MongoDBを利用した非同期推論処理の正常系までをCircleCIで自動検証できるようになりました。**
 
 今後は、正常系の確認に加えて、Worker停止やMongoDB障害といった異常系の自動検証を拡充していきます。
+
+
+## 15. 障害復旧シナリオのCI自動テスト（Phase 13）
+
+2026年10月22日、非同期推論処理基盤における障害復旧処理の統合テストを追加し、CircleCIで自動実行できるようにしました。
+
+Phase 12では、Redis Streamsへのジョブ投入からWorkerによるPyTorch推論、MongoDB保存、Redis ACKまでの正常系を検証しました。
+
+Phase 13では、MongoDB保存失敗やWorker停止相当の状況を再現し、未ACKメッセージの保持・再回収・復旧・DLQ隔離を検証しています。
+
+### 15.1 検証目的
+
+本Phaseの目的は、障害発生時にジョブが適切に扱われることを確認することです。
+
+検証する主な要件は以下のとおりです。
+
+- MongoDB保存が失敗した場合はRedis ACKを行わない。
+- ACKされなかったジョブはRedis Pendingに残す。
+- Workerが停止した場合、別WorkerがPendingジョブを再回収できる。
+- MongoDB接続が復旧した場合、ジョブを再処理して結果を保存できる。
+- 同一job_idによるMongoDBドキュメントの重複を防止する。
+- 再試行上限を超えたジョブはDLQに隔離する。
+- DLQへの記録後、元のRedisメッセージをACKする。
+- CI上でWorkerの起動・停止とタイムアウトを管理する。
+
+### 15.2 障害復旧の基本設計
+
+Workerでは、Redis StreamsのConsumer Groupを使用してジョブを処理します。
+
+```text
+Redis Streams
+    |
+    v
+XREADGROUP / XAUTOCLAIM
+    |
+    v
+Worker
+    |
+    v
+PyTorch推論
+    |
+    v
+MongoDB保存
+    |
+    +-- 成功 --> Redis ACK
+    |
+    +-- 失敗 --> ACKせずPending保持
+                       |
+                       v
+                 XAUTOCLAIM
+                       |
+                       v
+                    再処理
+                       |
+                       +-- 成功 --> MongoDB保存・ACK
+                       |
+                       +-- 上限超過 --> DLQ隔離・ACK
+```
+
+主なRedis設定は以下のとおりです。
+
+| 項目 | 設定値 |
+| --- | --- |
+| Stream | `inference_jobs` |
+| Consumer Group | `inference_workers` |
+| DLQ Stream | `inference_jobs_dead` |
+| Pending再回収 | `XAUTOCLAIM` |
+| 再回収アイドル時間 | 30,000ms（30秒） |
+| MongoDBデータベース | `ai_mobility` |
+| MongoDBコレクション | `inference_results` |
+
+再回収にはRedis Streamsの `XAUTOCLAIM` を使用しています。
+
+```python
+claimed = client.xautoclaim(
+    STREAM_NAME,
+    GROUP_NAME,
+    consumer,
+    min_idle_time=RECLAIM_IDLE_MS,
+    start_id="0-0",
+    count=10,
+)
+```
+
+再試行上限の判定には、既存の `should_dead_letter()` を使用します。
+
+MongoDB保存は `_id=job_id` を条件にしたupsert方式であり、再処理時に同じjob_idのドキュメントが重複しない設計です。
+
+### 15.3 Phase 13のテスト一覧
+
+Phase 13では、以下の4件の障害復旧テストを追加しました。
+
+| Phase | テストファイル | 検証内容 |
+| --- | --- | --- |
+| 13-1 | `test_worker_recovery.py` | Pending再回収 |
+| 13-2 | `test_worker_mongo_failure.py` | MongoDB保存失敗時の未ACK |
+| 13-3 | `test_worker_mongo_recovery.py` | MongoDB復旧後の再処理 |
+| 13-4 | `test_worker_dlq.py` | 再試行上限超過時のDLQ隔離 |
+
+すべて `tests/integration/` ディレクトリに配置しています。
+
+Phase 12で追加した以下の2件と合わせて、統合テストは合計6件となりました。
+
+- `test_services.py`
+- `test_worker_e2e.py`
+
+---
+
+### 15.4 Phase 13-1：Pendingジョブの再回収
+
+対象ファイル：
+
+`tests/integration/test_worker_recovery.py`
+
+#### 検証目的
+
+Workerがジョブを取得した後、ACKせずに停止した場合を想定し、別WorkerがPendingジョブを再回収できることを確認します。
+
+#### 障害状態の再現方法
+
+今回はWorker Aの強制終了を直接発生させる代わりに、Redis Consumer Group操作で未ACK状態を作成しました。
+
+1. Redis Streamsへジョブを投入する。
+2. Consumer Aが `XREADGROUP` でジョブを取得する。
+3. ACKを実行せず、Pendingに残す。
+4. 別プロセスでWorker Bを起動する。
+5. 30秒のアイドル条件を満たした後、Worker Bが `XAUTOCLAIM` で再回収する。
+6. Worker BがPyTorch推論を実行する。
+7. MongoDBに結果を保存し、ACKする。
+
+#### 検証項目
+
+| 項目 | 期待結果 |
+| --- | --- |
+| Consumer Aの受信 | 成功 |
+| Consumer AのACK | 未実行 |
+| Redis Pending | 対象ジョブが存在 |
+| Worker Bの再回収 | 成功 |
+| MongoDB保存 | 1件 |
+| 推論スコア | 約0.5 |
+| Redis Pending | 対象ジョブが消滅 |
+
+再回収までの待機時間を考慮し、最大80秒のタイムアウトを設定しました。
+
+#### 検証結果
+
+CircleCIで `integration-test` が正常終了しました。
+
+対象コミット：
+
+`2e181fd`
+
+このテストでは、未ACKジョブを別Workerが取得し、正常に処理できることを確認しました。
+
+ただし、実際のWorker Aプロセスを強制終了させた試験ではなく、Consumer Group操作で未ACK状態を再現した試験です。
+
+---
+
+### 15.5 Phase 13-2：MongoDB保存失敗時の未ACK検証
+
+対象ファイル：
+
+`tests/integration/test_worker_mongo_failure.py`
+
+#### 検証目的
+
+MongoDBに結果を保存できない場合、WorkerがACKを実行せず、Redis Pendingにジョブを保持することを確認します。
+
+#### 障害状態の再現方法
+
+MongoDBコンテナは停止させず、テスト対象Workerだけに無効なMongoDB接続先を指定しました。
+
+```text
+MONGO_URI=mongodb://127.0.0.1:1/?directConnection=true
+```
+
+WorkerがRedisからジョブを取得して推論を実行した後、MongoDBへの保存時に接続エラーが発生する構成です。
+
+#### 検証手順
+
+1. Redis・MongoDBの正常なサービス接続を確認する。
+2. MongoDB接続先が無効なWorkerを起動する。
+3. Redis Streamsへジョブを投入する。
+4. Workerの `Processing failed:` ログを確認する。
+5. 対象ジョブがPendingに残っていることを確認する。
+6. 正常なMongoDBに対象ジョブの保存結果が存在しないことを確認する。
+7. Workerを停止する。
+8. テスト用のPendingとStreamエントリを削除する。
+
+#### 検証項目
+
+| 項目 | 期待結果 |
+| --- | --- |
+| Worker起動 | 成功 |
+| Redisジョブ取得 | 成功 |
+| MongoDB保存 | 失敗 |
+| Workerログ | `Processing failed:` |
+| Redis ACK | 未実行 |
+| Redis Pending | 対象ジョブが存在 |
+| MongoDB保存結果 | 0件 |
+
+#### 検証結果
+
+CircleCIで4つのCIジョブすべてが成功しました。
+
+対象コミット：
+
+`5156ad2`
+
+このテストにより、MongoDB保存失敗時にRedis ACKが実行されないことを確認しました。
+
+なお、テスト終了時には後片付けとして明示的に `XACK` と `XDEL` を実行しています。
+
+これはテスト用データの削除処理であり、Workerが保存失敗時にACKしたことを意味しません。
+
+---
+
+### 15.6 Phase 13-3：MongoDB復旧後のPending再処理
+
+対象ファイル：
+
+`tests/integration/test_worker_mongo_recovery.py`
+
+#### 検証目的
+
+MongoDB保存に失敗したジョブがRedis Pendingに残り、正常なMongoDBに接続できる別Workerによって再処理されることを確認します。
+
+#### 障害状態の再現方法
+
+Worker AとWorker BでMongoDB接続先を変更します。
+
+Worker A：
+
+```text
+MONGO_URI=mongodb://127.0.0.1:1/?directConnection=true
+```
+
+Worker B：
+
+```text
+MONGO_URI=mongodb://localhost:27017/
+```
+
+実際のMongoDBサーバーを停止・再起動するのではなく、接続不能状態から正常接続状態への切り替えを再現しています。
+
+#### 検証手順
+
+1. Worker Aを無効なMongoDB接続先で起動する。
+2. Redis Streamsへジョブを投入する。
+3. Worker AのMongoDB保存失敗を確認する。
+4. 対象ジョブがRedis Pendingに残っていることを確認する。
+5. 配信回数が1回であることを確認する。
+6. Worker Aを停止する。
+7. Worker Bを正常なMongoDB接続先で起動する。
+8. Worker Bが `XAUTOCLAIM` でジョブを再回収する。
+9. Worker BがPyTorch推論を実行する。
+10. MongoDB保存とRedis ACKを確認する。
+
+#### 検証項目
+
+| 項目 | 期待結果 |
+| --- | --- |
+| Worker AのMongoDB保存 | 失敗 |
+| Worker AのACK | 未実行 |
+| Redis Pending | 対象ジョブが存在 |
+| Worker Bの再回収 | 成功 |
+| Worker Bの推論 | 成功 |
+| MongoDB保存件数 | 1件 |
+| Redis ACK | 成功 |
+| Redis Pending | 対象ジョブが消滅 |
+
+Worker Bの再回収を考慮し、最大80秒のタイムアウトを設けました。
+
+#### 検証結果
+
+CircleCIの4ジョブすべてが成功しました。
+
+対象コミット：
+
+`7eceff3`
+
+Worker Aで保存できなかったジョブを、Worker Bが再回収してMongoDB保存・ACKまで完了することを確認しました。
+
+ただし、これはMongoDBサーバー自体の停止・復旧試験ではありません。
+
+---
+
+### 15.7 Phase 13-4：再試行上限超過時のDLQ隔離
+
+対象ファイル：
+
+`tests/integration/test_worker_dlq.py`
+
+#### 検証目的
+
+再試行上限を超えたジョブが、通常の推論処理を行わずにDLQへ隔離され、元メッセージがACKされることを確認します。
+
+#### DLQ処理の設計
+
+Workerは `get_delivery_count()` でRedis Pendingの配信回数を取得し、`should_dead_letter()` で隔離対象か判定します。
+
+DLQ隔離処理では、Redisのトランザクションを使用しています。
+
+```python
+with client.pipeline(transaction=True) as pipe:
+    pipe.xadd(DEAD_LETTER_STREAM, record)
+    pipe.xack(STREAM_NAME, GROUP_NAME, message_id)
+    results = pipe.execute()
+```
+
+これにより、Redis側ではDLQへの記録と元メッセージのACKを同一トランザクション内で処理します。
+
+#### 再試行上限状態の再現方法
+
+テストでは、既存の `should_dead_letter()` からDLQ移行の境界となる配信回数を取得します。
+
+```python
+thresholds = [
+    count
+    for count in range(2, 21)
+    if should_dead_letter(count)
+    and not should_dead_letter(count - 1)
+]
+```
+
+続いてRedisの `XCLAIM` を使用し、配信回数とアイドル時間を調整します。
+
+```python
+redis_client.execute_command(
+    "XCLAIM",
+    STREAM,
+    GROUP,
+    initial_consumer,
+    0,
+    message_id,
+    "IDLE",
+    31_000,
+    "RETRYCOUNT",
+    threshold - 1,
+)
+```
+
+これにより、30秒ずつ再試行を待つことなく、再試行上限直前のPending状態を作成します。
+
+その後、実際のWorkerを起動し、`XAUTOCLAIM` による再配信で上限に到達させます。
+
+#### 検証項目
+
+| 項目 | 期待結果 |
+| --- | --- |
+| 再試行上限直前のPending作成 | 成功 |
+| Workerの `XAUTOCLAIM` | 成功 |
+| DLQへの記録 | 1件 |
+| 元メッセージのACK | 成功 |
+| Redis Pending | 対象ジョブが消滅 |
+| MongoDB推論結果 | 0件 |
+| Workerログ | `Retry exhausted:` |
+
+#### 検証結果
+
+CircleCIで4つのCIジョブすべてが正常終了しました。
+
+対象コミット：
+
+`2b15713`
+
+DLQへの隔離、元メッセージのACK、MongoDBに推論結果が存在しないことを検証しました。
+
+ただし、Redisトランザクション実行中に障害を発生させる試験ではありません。
+
+そのため、障害発生時の原子性まで実証したものではなく、既存トランザクション処理の正常な実行結果を確認したものです。
+
+---
+
+### 15.8 CircleCI統合テストの最終結果
+
+2026年10月22日、Phase 13-4までの全テストをCircleCIで実行しました。
+
+対象パイプライン：
+
+`ai-mobility-inference-poc #18`
+
+対象コミット：
+
+`2b15713`
+
+CircleCI実行結果：
+
+```text
+......                           [100%]
+6 passed in 74.99s (0:01:14)
+```
+
+#### 統合テストの内訳
+
+| No. | テスト | 結果 |
+| --- | --- | --- |
+| 1 | Redis・MongoDBサービス連携 | PASS |
+| 2 | Worker正常系E2E | PASS |
+| 3 | Pending再回収 | PASS |
+| 4 | MongoDB保存失敗時の未ACK | PASS |
+| 5 | MongoDB復旧後のPending再処理 | PASS |
+| 6 | 再試行上限超過時のDLQ隔離 | PASS |
+
+**統合テスト6件すべて成功、失敗0件**
+
+#### CircleCIのジョブ実行結果
+
+| ジョブ | 実行時間 | 結果 |
+| --- | ---: | --- |
+| `test` | 17秒 | Success |
+| `k8s-validate` | 5秒 | Success |
+| `integration-test` | 2分00秒 | Success |
+| `docker-build` | 51秒 | Success |
+
+ワークフロー全体：
+
+```text
+2分02秒
+```
+
+単体テスト31件と統合テスト6件は、それぞれ独立したCircleCIジョブとして実行しています。
+
+合計37件のテストがCI構成に組み込まれました。
+
+Kubernetesマニフェストについては、別途9リソースのスキーマ検証を実施しています。
+
+---
+
+### 15.9 タイムアウト・プロセス管理
+
+障害復旧テストでは、Workerを `subprocess.Popen()` で別プロセスとして起動しています。
+
+常駐Workerは通常、無限ループでジョブを待機するため、テスト終了時に明示的な停止処理が必要です。
+
+主なタイムアウト設定は以下のとおりです。
+
+| 対象 | 最大待機時間 |
+| --- | ---: |
+| Pending再回収 | 80秒 |
+| MongoDB保存失敗の検知 | 35秒 |
+| MongoDB復旧後の再処理 | 80秒 |
+| DLQ隔離処理 | 45秒 |
+| Worker正常終了待機 | 5秒 |
+
+Worker終了時には、原則として以下の順序で停止します。
+
+```python
+process.terminate()
+
+try:
+    process.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    process.kill()
+    process.wait(timeout=5)
+```
+
+失敗時にはWorkerの標準出力・標準エラーをログから取得できるようにしています。
+
+また、テスト終了時には、ジョブIDに対応するMongoDBデータとRedis Streamエントリを削除します。
+
+RedisのStream名とConsumer Group名は現時点では固定値のため、これらの障害復旧テストはCI専用の隔離されたサービス環境で実行します。
+
+---
+
+### 15.10 Phase 13で検証できたこと・できていないこと
+
+#### 検証できたこと
+
+- Redis Consumer GroupのPending管理
+- WorkerによるPending再回収
+- MongoDB保存失敗時の未ACK
+- MongoDB接続復旧を模擬した再処理
+- 再処理後のMongoDB保存
+- MongoDBのjob_id単位の冪等保存
+- 再処理後のRedis ACK
+- 再試行上限到達時のDLQ隔離
+- DLQ隔離後の元メッセージACK
+- CircleCI上での障害復旧テスト自動実行
+
+#### 未検証の項目
+
+以下はPhase 13の検証対象外です。
+
+1. 実際のMongoDBサーバー停止・再起動
+2. Workerプロセスを処理途中で強制終了する試験
+3. Kubernetes Podの強制終了と自動再起動
+4. 複数Workerが同時にPendingを回収する競合状況
+5. Redisサーバーの停止・再起動
+6. Redisトランザクション中断時の障害注入
+7. DLQからの再投入・手動復旧手順
+8. 高負荷時の障害復旧性能
+9. MongoDB 8系でのCircleCI統合試験
+10. CIを繰り返し実行した際のフレーキーテストの検出
+
+これらは、今後の品質改善課題として扱います。
+
+---
+
+### 15.11 今後の改善方針（Phase 14）
+
+Phase 13までに、正常系E2Eと主要な障害復旧シナリオの自動テストを構築しました。
+
+次のPhase 14では、CIの実行効率とテストの安定性を改善する予定です。
+
+#### 改善候補
+
+1. PyTorch依存関係のキャッシュによるインストール時間の短縮
+2. 統合テストの所要時間の計測と分析
+3. テストデータの分離方式の見直し
+4. Worker起動待機処理の共通化
+5. Workerプロセス終了処理の共通化
+6. 固定Stream名によるテスト間干渉の低減
+7. タイムアウト値の妥当性確認
+8. 統合テストの繰り返し実行による安定性評価
+9. pytestのテストカバレッジ計測
+10. CircleCI実行時間・クレジット消費の継続的な確認
+
+特に、今回のCircleCIパイプラインでは `integration-test` に約2分を要しており、依存ライブラリのインストールとPending再回収待機が主な改善候補です。
+
+ただし、テスト時間短縮のために本番Workerの再回収条件や障害復旧仕様を変更することは避け、テスト環境の最適化を優先する方針です。
+
+---
+
+### 15.12 Phase 13まとめ
+
+Phase 13では、非同期推論処理基盤の障害復旧シナリオをCircleCIで自動検証しました。
+
+検証した流れは以下のとおりです。
+
+```text
+Phase 13-1
+未ACKジョブのPending再回収
+    ↓
+Phase 13-2
+MongoDB保存失敗時の未ACK
+    ↓
+Phase 13-3
+MongoDB復旧後の再処理・ACK
+    ↓
+Phase 13-4
+再試行上限超過時のDLQ隔離・ACK
+```
+
+最終的なCI実行結果：
+
+```text
+Python単体テスト       31件
+統合テスト              6件
+Kubernetes検証          9リソース
+
+CircleCIジョブ          4件成功
+統合テスト実行時間      74.99秒
+ワークフロー実行時間    2分02秒
+```
+
+**本PoCでは、正常系の非同期推論処理に加えて、未ACK保持・Pending再回収・MongoDB復旧後の再処理・DLQ隔離までをCircleCIで自動検証できるようになりました。**
+
+これにより、障害発生時のデータ処理について、再現可能なテストに基づいて動作を説明できる状態になりました。
+
+今後は、CIの効率化とテストの安定性を高め、より実運用に近い障害シナリオへ検証範囲を拡張していきます。
