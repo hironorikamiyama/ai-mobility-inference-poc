@@ -176,7 +176,7 @@ jobs:
 
       - restore_cache:
           keys:
-            - integration-venv-v1-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
+            - integration-venv-v2-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
 
       - run:
           name: Prepare integration environment
@@ -198,6 +198,7 @@ jobs:
                 --index-url https://download.pytorch.org/whl/cpu
 
               .venv/bin/python -m pip install \
+                "numpy>=2,<3" \
                 "redis>=6,<7" \
                 "pymongo>=4,<5" \
                 pytest
@@ -209,7 +210,7 @@ jobs:
             .venv/bin/python -m pytest --version
 
       - save_cache:
-          key: integration-venv-v1-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
+          key: integration-venv-v2-py3148-torch2141-{{ arch }}-{{ checksum "requirements.txt" }}
           paths:
             - .venv
 
