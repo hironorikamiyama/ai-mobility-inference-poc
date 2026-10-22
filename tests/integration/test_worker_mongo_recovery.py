@@ -124,8 +124,8 @@ def test_mongodb_recovery_reprocesses_pending():
                 "?directConnection=true"
             ),
             log_file=log_a,
+            reclaim_idle_ms=30000,
         )
-        wait_until_started(worker_a, log_a)
 
         # 2. Worker Aに処理させるジョブを投入
         message_id = redis_client.xadd(
@@ -180,6 +180,7 @@ def test_mongodb_recovery_reprocesses_pending():
             consumer=consumer_b,
             mongo_uri=healthy_mongo_uri,
             log_file=log_b,
+            reclaim_idle_ms=1000,
         )
         wait_until_started(worker_b, log_b)
 
