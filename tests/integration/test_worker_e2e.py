@@ -1,11 +1,7 @@
 import os
-import subprocess
 import sys
-import tempfile
 import time
 import uuid
-
-from pathlib import Path
 
 from pymongo import MongoClient
 from redis import Redis
@@ -15,8 +11,10 @@ STREAM = "inference_jobs"
 GROUP = "inference_workers"
 
 
-def test_worker_end_to_end():
-    job_id = f"ci-e2e-{uuid.uuid4().hex}"
+def test_worker_end_to_end(worker_processes):
+    suffix = uuid.uuid4().hex
+    job_id = f"ci-e2e-{suffix}"
+    consumer = f"ci-e2e-worker-{suffix}"
 
     redis_client = Redis(
         host=os.getenv("REDIS_HOST", "localhost"),
@@ -25,61 +23,35 @@ def test_worker_end_to_end():
         socket_connect_timeout=3,
     )
 
-    mongo_client = MongoClient(
-        os.getenv("MONGO_URI", "mongodb://localhost:27017/"),
-        serverSelectionTimeoutMS=3000,
+    mongo_uri = os.getenv(
+        "MONGO_URI",
+        "mongodb://localhost:27017/",
     )
 
+    mongo_client = MongoClient(
+        mongo_uri,
+        serverSelectionTimeoutMS=3000,
+    )
     collection = mongo_client["ai_mobility"]["inference_results"]
 
-    worker_process = None
-    worker_log = tempfile.TemporaryFile(mode="w+t")
+    worker = None
+    message_id = None
 
     try:
         assert redis_client.ping()
         mongo_client.admin.command("ping")
 
-        env = os.environ.copy()
-        env["REDIS_HOST"] = "localhost"
-        env["MONGO_URI"] = os.getenv(
-            "MONGO_URI", "mongodb://localhost:27017/"
-        )
-        env["READ_BATCH_SIZE"] = "1"
-        env["OMP_NUM_THREADS"] = "1"
-        env["MKL_NUM_THREADS"] = "1"
-        env["PYTHONUNBUFFERED"] = "1"
-
-        worker_process = subprocess.Popen(
-            [sys.executable, "-m", "src.worker"],
-            env=env,
-            stdout=worker_log,
-            stderr=subprocess.STDOUT,
+        # 共通fixtureを使用して実際のWorkerを起動
+        worker = worker_processes(
+            consumer=consumer,
+            mongo_uri=mongo_uri,
+            reclaim_idle_ms=30000,
         )
 
-        # Workerの初期化とConsumer Group作成を待機
-        deadline = time.monotonic() + 60
+        worker.wait_until_started()
 
-        while time.monotonic() < deadline:
-            if worker_process.poll() is not None:
-                raise RuntimeError(
-                    "Worker exited during startup"
-                )
-
-            try:
-                groups = redis_client.xinfo_groups(STREAM)
-                if any(g["name"] == GROUP for g in groups):
-                    break
-            except Exception:
-                pass
-
-            time.sleep(0.2)
-        else:
-            raise TimeoutError(
-                "Worker Consumer Group startup timed out"
-            )
-
-        # 実際のWorkerが処理するジョブを投入
-        redis_client.xadd(
+        # Redis Streamsへジョブを投入
+        message_id = redis_client.xadd(
             STREAM,
             {
                 "job_id": job_id,
@@ -87,24 +59,42 @@ def test_worker_end_to_end():
             },
         )
 
-        # MongoDB保存とACK完了まで待機
+        # MongoDB保存・Redis ACKの完了を待機
         deadline = time.monotonic() + 45
 
         while time.monotonic() < deadline:
-            if worker_process.poll() is not None:
+            if worker.process.poll() is not None:
                 raise RuntimeError(
-                    "Worker exited during processing"
+                    "Worker exited during processing:\n"
+                    + worker.read_log()
                 )
 
             document = collection.find_one({"_id": job_id})
 
-            if document is not None:
+            pending = redis_client.xpending_range(
+                STREAM,
+                GROUP,
+                min=message_id,
+                max=message_id,
+                count=1,
+            )
+
+            if document is not None and not pending:
                 assert abs(document["score"] - 0.5) < 1e-5
                 assert document["device"] == "cpu"
 
-                pending = redis_client.xpending(STREAM, GROUP)
-                if pending["pending"] == 0:
-                    break
+                assert collection.count_documents(
+                    {"_id": job_id}
+                ) == 1
+
+                logs = worker.read_log()
+                assert f"Processed: job_id={job_id}" in logs
+
+                print(
+                    f"Worker E2E succeeded: job_id={job_id}",
+                    flush=True,
+                )
+                break
 
             time.sleep(0.2)
         else:
@@ -112,31 +102,23 @@ def test_worker_end_to_end():
                 "MongoDB save or Redis ACK timed out"
             )
 
-        assert collection.count_documents(
-            {"_id": job_id}
-        ) == 1
-
-    except Exception:
-        worker_log.flush()
-        worker_log.seek(0)
-        print(
-            "\n=== Worker log ===\n"
-            + worker_log.read(),
-            file=sys.stderr,
-        )
-        raise
-
     finally:
-        if worker_process is not None:
-            if worker_process.poll() is None:
-                worker_process.terminate()
-                try:
-                    worker_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    worker_process.kill()
-                    worker_process.wait(timeout=5)
+        # Redis/MongoDBのテストデータ削除前にWorkerを停止
+        if worker is not None:
+            worker.stop()
+
+        if sys.exc_info()[0] is not None and worker is not None:
+            print(
+                "\n=== Worker log ===\n"
+                + worker.read_log(),
+                file=sys.stderr,
+            )
+
+        if message_id is not None:
+            redis_client.xdel(STREAM, message_id)
 
         collection.delete_one({"_id": job_id})
         mongo_client.close()
         redis_client.close()
-        worker_log.close()
+
+        # ログファイルはfixtureが閉じる
