@@ -74,7 +74,9 @@ def wait_until_started(process, log_file, timeout=30):
     raise TimeoutError("Worker startup timed out")
 
 
-def test_mongodb_recovery_reprocesses_pending():
+def test_mongodb_recovery_reprocesses_pending(
+    worker_processes,
+):
     suffix = uuid.uuid4().hex
     job_id = f"ci-mongo-recovery-{suffix}"
     consumer_a = f"ci-failure-{suffix}"
@@ -117,15 +119,16 @@ def test_mongodb_recovery_reprocesses_pending():
                 raise
 
         # 1. Worker Aを無効なMongoDB接続先で起動
-        worker_a = start_worker(
+        worker_a = worker_processes(
             consumer=consumer_a,
             mongo_uri=(
                 "mongodb://127.0.0.1:1/"
                 "?directConnection=true"
             ),
-            log_file=log_a,
             reclaim_idle_ms=30000,
         )
+
+        worker_a.wait_until_started()
 
         # 2. Worker Aに処理させるジョブを投入
         message_id = redis_client.xadd(
@@ -176,13 +179,13 @@ def test_mongodb_recovery_reprocesses_pending():
         assert worker_a.poll() is not None
 
         # 5. Worker Bを正常なMongoDB接続先で起動
-        worker_b = start_worker(
+        worker_b = worker_processes(
             consumer=consumer_b,
             mongo_uri=healthy_mongo_uri,
-            log_file=log_b,
             reclaim_idle_ms=1000,
         )
-        wait_until_started(worker_b, log_b)
+
+        worker_b.wait_until_started()
 
         # 6. 30秒の再回収条件を含めて処理完了を待つ
         deadline = time.monotonic() + 20
@@ -241,16 +244,19 @@ def test_mongodb_recovery_reprocesses_pending():
         stop_worker(worker_b)
 
         if sys.exc_info()[0] is not None:
-            print(
-                "\n=== Worker A log ===\n"
-                + read_log(log_a),
-                file=sys.stderr,
-            )
-            print(
-                "\n=== Worker B log ===\n"
-                + read_log(log_b),
-                file=sys.stderr,
-            )
+            if worker_a is not None:
+                print(
+                    "\n=== Worker A log ===\n"
+                    + worker_a.read_log(),
+                    file=sys.stderr,
+                )
+
+            if worker_b is not None:
+                print(
+                    "\n=== Worker B log ===\n"
+                    + worker_b.read_log(),
+                    file=sys.stderr,
+                )
 
         if message_id is not None:
             redis_client.xack(STREAM, GROUP, message_id)
