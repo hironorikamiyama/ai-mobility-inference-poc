@@ -140,12 +140,12 @@ def test_mongodb_recovery_reprocesses_pending(
         deadline = time.monotonic() + 45
 
         while time.monotonic() < deadline:
-            if worker_a.poll() is not None:
+            if worker_a.process.poll() is not None:
                 raise RuntimeError(
                     "Worker A exited unexpectedly"
                 )
 
-            logs = read_log(log_a)
+            logs = worker_a.read_log()
 
             if (
                 "Processing failed:" in logs
@@ -175,8 +175,8 @@ def test_mongodb_recovery_reprocesses_pending(
         print("Message remains Pending", flush=True)
 
         # 4. 障害Workerを停止
-        stop_worker(worker_a)
-        assert worker_a.poll() is not None
+        worker_a.stop()
+        assert worker_a.process.poll() is not None
 
         # 5. Worker Bを正常なMongoDB接続先で起動
         worker_b = worker_processes(
@@ -191,7 +191,7 @@ def test_mongodb_recovery_reprocesses_pending(
         deadline = time.monotonic() + 20
 
         while time.monotonic() < deadline:
-            if worker_b.poll() is not None:
+            if worker_b.process.poll() is not None:
                 raise RuntimeError(
                     "Worker B exited unexpectedly"
                 )
@@ -207,7 +207,7 @@ def test_mongodb_recovery_reprocesses_pending(
 
             recovered_by_b = (
                 f"Processed: job_id={job_id}"
-                in read_log(log_b)
+                in worker_b.read_log()
             )
 
             if (
@@ -239,9 +239,11 @@ def test_mongodb_recovery_reprocesses_pending(
             )
 
     finally:
-        # 後片付け前に両Workerを停止
-        stop_worker(worker_a)
-        stop_worker(worker_b)
+        if worker_a is not None:
+            worker_a.stop()
+
+        if worker_b is not None:
+            worker_b.stop()
 
         if sys.exc_info()[0] is not None:
             if worker_a is not None:
