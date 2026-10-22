@@ -32,7 +32,12 @@ def stop_worker(process):
         process.wait(timeout=5)
 
 
-def start_worker(consumer, mongo_uri, log_file):
+def start_worker(
+    consumer,
+    mongo_uri,
+    log_file,
+    reclaim_idle_ms=30000,
+):
     env = os.environ.copy()
     env.update({
         "REDIS_HOST": os.getenv("REDIS_HOST", "localhost"),
@@ -43,7 +48,7 @@ def start_worker(consumer, mongo_uri, log_file):
         "MKL_NUM_THREADS": "1",
         "PYTHONUNBUFFERED": "1",
         "WORKER_PROCESSING_DELAY_SECONDS": "0",
-        "RECLAIM_IDLE_MS": "1000",
+        "RECLAIM_IDLE_MS": str(reclaim_idle_ms),
     })
 
     return subprocess.Popen(
