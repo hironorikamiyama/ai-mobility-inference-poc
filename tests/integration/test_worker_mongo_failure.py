@@ -1,7 +1,5 @@
 import os
-import subprocess
 import sys
-import tempfile
 import time
 import uuid
 
@@ -14,7 +12,7 @@ STREAM = "inference_jobs"
 GROUP = "inference_workers"
 
 
-def test_mongodb_failure_keeps_message_pending():
+def test_mongodb_failure_keeps_message_pending(worker_processes):
     suffix = uuid.uuid4().hex
     job_id = f"ci-mongo-failure-{suffix}"
     consumer = f"ci-mongo-failure-worker-{suffix}"
@@ -27,24 +25,18 @@ def test_mongodb_failure_keeps_message_pending():
     )
 
     mongo_client = MongoClient(
-        os.getenv(
-            "MONGO_URI",
-            "mongodb://localhost:27017/",
-        ),
+        os.getenv("MONGO_URI", "mongodb://localhost:27017/"),
         serverSelectionTimeoutMS=3000,
     )
-
     collection = mongo_client["ai_mobility"]["inference_results"]
 
-    worker_process = None
+    worker = None
     message_id = None
-    worker_log = tempfile.TemporaryFile(mode="w+t")
 
     try:
         assert redis_client.ping()
         mongo_client.admin.command("ping")
 
-        # Consumer Groupを準備
         try:
             redis_client.xgroup_create(
                 STREAM,
@@ -56,48 +48,20 @@ def test_mongodb_failure_keeps_message_pending():
             if "BUSYGROUP" not in str(exc):
                 raise
 
-        # Workerに渡すMongoDB接続先だけを無効化
-        env = os.environ.copy()
-        env["REDIS_HOST"] = os.getenv(
-            "REDIS_HOST", "localhost"
-        )
-        env["MONGO_URI"] = (
-            "mongodb://127.0.0.1:1/"
-            "?directConnection=true"
-        )
-        env["CONSUMER_NAME"] = consumer
-        env["READ_BATCH_SIZE"] = "1"
-        env["OMP_NUM_THREADS"] = "1"
-        env["MKL_NUM_THREADS"] = "1"
-        env["PYTHONUNBUFFERED"] = "1"
-
-        worker_process = subprocess.Popen(
-            [sys.executable, "-m", "src.worker"],
-            env=env,
-            stdout=worker_log,
-            stderr=subprocess.STDOUT,
+        # MongoDB保存だけを失敗させるWorkerを起動
+        worker = worker_processes(
+            consumer=consumer,
+            mongo_uri=(
+                "mongodb://127.0.0.1:1/"
+                "?directConnection=true"
+            ),
+            # 保存エラー発生後の即時再回収を防ぐ
+            reclaim_idle_ms=30000,
         )
 
-        # Consumer Groupが存在することを確認
-        deadline = time.monotonic() + 30
+        worker.wait_until_started()
 
-        while time.monotonic() < deadline:
-            if worker_process.poll() is not None:
-                raise RuntimeError(
-                    "Worker exited during startup"
-                )
-
-            groups = redis_client.xinfo_groups(STREAM)
-            if any(group["name"] == GROUP for group in groups):
-                break
-
-            time.sleep(0.2)
-        else:
-            raise TimeoutError(
-                "Consumer Group startup timed out"
-            )
-
-        # MongoDB保存に失敗させるジョブを投入
+        # Workerへジョブを投入
         message_id = redis_client.xadd(
             STREAM,
             {
@@ -106,39 +70,31 @@ def test_mongodb_failure_keeps_message_pending():
             },
         )
 
-        print(
-            f"Job submitted: {job_id}",
-            flush=True,
-        )
-
-        # 保存失敗のログが出るまで待機
+        # MongoDB接続失敗ログを待つ
         deadline = time.monotonic() + 35
-        error_observed = False
 
         while time.monotonic() < deadline:
-            if worker_process.poll() is not None:
+            if worker.process.poll() is not None:
                 raise RuntimeError(
-                    "Worker exited unexpectedly"
+                    "Worker exited unexpectedly:\n"
+                    + worker.read_log()
                 )
 
-            worker_log.flush()
-            worker_log.seek(0)
-            logs = worker_log.read()
+            logs = worker.read_log()
 
             if (
                 "Processing failed:" in logs
                 and f"stream_id={message_id}" in logs
             ):
-                error_observed = True
                 break
 
             time.sleep(0.2)
+        else:
+            raise TimeoutError(
+                "MongoDB save failure was not observed"
+            )
 
-        assert error_observed, (
-            "MongoDB save failure was not observed"
-        )
-
-        # 未ACKの対象ジョブがPendingに残っている
+        # WorkerがACKしなかったことを確認
         pending = redis_client.xpending_range(
             STREAM,
             GROUP,
@@ -151,52 +107,34 @@ def test_mongodb_failure_keeps_message_pending():
         assert pending[0]["message_id"] == message_id
         assert pending[0]["consumer"] == consumer
 
-        # 正常なMongoDBにも対象データが存在しない
-        assert collection.find_one(
-            {"_id": job_id}
-        ) is None
+        # 正常なMongoDBには結果が存在しない
+        assert collection.find_one({"_id": job_id}) is None
 
-        print(
-            "MongoDB failure confirmed",
-            flush=True,
-        )
+        print("MongoDB failure confirmed", flush=True)
         print(
             "Redis Pending retained; ACK not executed",
             flush=True,
         )
 
     finally:
-        # 最初にWorkerを停止して再処理を防ぐ
-        if worker_process is not None:
-            if worker_process.poll() is None:
-                worker_process.terminate()
-                try:
-                    worker_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    worker_process.kill()
-                    worker_process.wait(timeout=5)
+        # データ削除前にWorkerを停止
+        if worker is not None:
+            worker.stop()
 
-        worker_log.flush()
-        worker_log.seek(0)
-        logs = worker_log.read()
-
-        if sys.exc_info()[0] is not None:
+        if sys.exc_info()[0] is not None and worker is not None:
             print(
-                "\n=== Worker log ===\n" + logs,
+                "\n=== Worker log ===\n"
+                + worker.read_log(),
                 file=sys.stderr,
             )
 
-        # CIテストで作成したPendingのみ後片付け
+        # テスト用メッセージのみ削除
         if message_id is not None:
-            redis_client.xack(
-                STREAM, GROUP, message_id
-            )
-            redis_client.xdel(
-                STREAM, message_id
-            )
+            redis_client.xack(STREAM, GROUP, message_id)
+            redis_client.xdel(STREAM, message_id)
 
         collection.delete_one({"_id": job_id})
-
         mongo_client.close()
         redis_client.close()
-        worker_log.close()
+
+        # ログファイルのcloseはfixtureが担当
