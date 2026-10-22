@@ -1899,3 +1899,642 @@ CircleCIの導入によって、これまでローカル環境で実施してい
 今回の測定では、仮想環境キャッシュの再利用時にジョブ実行時間が39秒となり、初回実行の80秒から41秒短縮しました。
 
 **CIを構築するだけでなく、実際のログと計測値を基に実行方式を改善し、その効果を検証しました。**
+
+
+## 11. CircleCIによるDockerイメージ検証（Phase 10）
+
+2026年10月21日、CircleCIのCIパイプラインにDockerイメージのビルド・起動検証を追加しました。
+
+Phase 9ではPython単体テストの自動化を実施しましたが、Phase 10では、実際にKubernetesへ配置するコンテナイメージが正常にビルドできることを検証対象としました。
+
+### 11.1 検証目的
+
+- GitHubへのpush時にDockerイメージを自動ビルドする。
+- Dockerfileのビルドエラーを検出する。
+- ビルドしたイメージをコンテナとして起動する。
+- コンテナ内でPythonとPyTorchが正常に動作することを確認する。
+- Python単体テストとDockerビルド検証を独立したジョブで実行する。
+
+### 11.2 Dockerビルドジョブ
+
+CircleCIでは `setup_remote_docker` を利用し、Dockerイメージをビルドします。
+
+設定例：
+
+```yaml
+docker-build:
+  docker:
+    - image: cimg/base:stable
+
+  resource_class: medium
+
+  steps:
+    - checkout
+
+    - setup_remote_docker
+
+    - run:
+        name: Check Docker environment
+        command: |
+          docker version
+          docker info
+
+    - run:
+        name: Build inference worker image
+        command: |
+          docker build \
+            --tag ai-mobility-inference-poc:ci \
+            .
+
+    - run:
+        name: Verify Docker image
+        command: |
+          docker image inspect \
+            ai-mobility-inference-poc:ci \
+            --format 'Image ID: {{.Id}}'
+
+          docker image inspect \
+            ai-mobility-inference-poc:ci \
+            --format 'Image size: {{.Size}} bytes'
+
+    - run:
+        name: Smoke test Docker image
+        command: |
+          docker run --rm \
+            --entrypoint python \
+            ai-mobility-inference-poc:ci \
+            -c "import torch; print('PyTorch:', torch.__version__)"
+```
+
+### 11.3 実行結果
+
+| 項目 | 結果 |
+| --- | --- |
+| CIジョブ | `docker-build` |
+| 実行環境 | Remote Docker / Medium |
+| Dockerイメージビルド | 成功 |
+| イメージ検証 | 成功 |
+| コンテナ起動 | 成功 |
+| PyTorch import | 成功 |
+| PyTorchバージョン | `2.14.1+cpu` |
+| ジョブ実行時間 | 44秒 |
+
+スモークテストの出力：
+
+```text
+PyTorch: 2.14.1+cpu
+```
+
+これにより、CircleCI上で作成したイメージをコンテナとして起動し、PyTorchが利用できることを確認しました。
+
+### 11.4 検証範囲の制約
+
+このスモークテストでは、RedisやMongoDBとの接続は行っていません。
+
+また、KubernetesへのデプロイやWorkerによるジョブ処理も、このジョブでは検証していません。
+
+Phase 10は、Dockerイメージのビルドと基本的な実行環境の確認を目的としています。
+
+---
+
+## 12. Kubernetesマニフェストの自動検証（Phase 11）
+
+2026年10月21日、CircleCIにKubernetesマニフェストのスキーマ検証を追加しました。
+
+### 12.1 検証目的
+
+- Kubernetesマニフェストの構文エラーを検出する。
+- Kubernetes APIのスキーマに適合していることを確認する。
+- 不明なフィールドや重複キーなどを検出する。
+- 実際のKubernetesクラスタを起動せずに検証する。
+- GitHubへのpush時に検証を自動実行する。
+
+### 12.2 Kubeconformの導入
+
+Kubernetesマニフェストの検証にはKubeconformを使用しました。
+
+検証時のバージョン：
+
+```text
+Kubeconform v0.6.3
+Kubernetes v1.37.0
+```
+
+CircleCIの `k8s-validate` ジョブに、Kubeconformのインストール処理を追加しました。
+
+```yaml
+k8s-validate:
+  docker:
+    - image: cimg/base:stable
+
+  resource_class: small
+
+  steps:
+    - checkout
+
+    - run:
+        name: Install Kubeconform
+        command: |
+          set -euo pipefail
+
+          KUBECONFORM_VERSION="v0.6.3"
+
+          curl --fail --location --retry 3 \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            -o /tmp/kubeconform.tar.gz
+
+          mkdir -p /tmp/kubeconform-bin
+
+          tar -xzf /tmp/kubeconform.tar.gz \
+            -C /tmp/kubeconform-bin kubeconform
+
+          /tmp/kubeconform-bin/kubeconform -v
+
+    - run:
+        name: Validate Kubernetes manifests
+        command: |
+          set -euo pipefail
+
+          /tmp/kubeconform-bin/kubeconform \
+            -strict \
+            -summary \
+            -kubernetes-version 1.37.0 \
+            k8s/
+```
+
+### 12.3 検証オプション
+
+| オプション | 内容 |
+| --- | --- |
+| `-strict` | スキーマ外フィールドや重複キーなどを厳格に検証 |
+| `-summary` | 検証結果のサマリーを出力 |
+| `-kubernetes-version 1.37.0` | 対象Kubernetesバージョン |
+| `k8s/` | マニフェストを格納するディレクトリ |
+
+スキーマが存在しないリソースを自動的にスキップする `-ignore-missing-schemas` は使用していません。
+
+### 12.4 検証結果
+
+CircleCIの実行ログ：
+
+```text
+Summary: 9 resources found in 6 files - Valid: 9, Invalid: 0, Errors: 0, Skipped: 0
+```
+
+| 項目 | 結果 |
+| --- | --- |
+| CIジョブ | `k8s-validate` |
+| 実行環境 | Docker / Small |
+| 実行時間 | 4秒 |
+| 検証対象ファイル | 6 |
+| Kubernetesリソース | 9 |
+| Valid | 9 |
+| Invalid | 0 |
+| Errors | 0 |
+| Skipped | 0 |
+
+対象となった9リソースは、すべてスキーマ検証を通過しました。
+
+### 12.5 検証範囲の制約
+
+Kubeconformによる検証は静的なスキーマ検証です。
+
+以下の項目については、実際のKubernetes環境での検証が必要です。
+
+- コンテナイメージの取得
+- Podの起動・再起動
+- PVCのプロビジョニング
+- ConfigMap・Secretの参照
+- Redis・MongoDBへの接続
+- サービス間通信
+- リソース不足によるスケジューリング失敗
+
+マニフェストが正常であることと、システムが正常稼働することは区別して評価します。
+
+---
+
+## 13. Redis・MongoDB統合テストの自動化（Phase 12）
+
+2026年10月21〜22日、CircleCI上にRedisとMongoDBを起動し、Pythonによる統合テストを自動実行する環境を構築しました。
+
+Phase 12では、最初にRedis StreamsとMongoDB保存処理の連携を検証し、その後、実際の推論Workerを起動するE2E統合テストへ拡張しました。
+
+### 13.1 検証目的
+
+- CircleCI上でRedis・MongoDBを起動する。
+- Redis Streamsのジョブ投入・取得・ACKを検証する。
+- MongoDBへの結果保存を検証する。
+- 同一 `job_id` による重複ドキュメントの防止を確認する。
+- 実際のWorkerによるPyTorch推論を検証する。
+- MongoDB保存成功後のRedis ACKを確認する。
+- 統合テストのタイムアウトとWorkerの終了処理を実装する。
+
+### 13.2 CircleCIのサービス構成
+
+CircleCIのDocker Executorを利用し、Python実行環境に加えてRedisとMongoDBのサービスコンテナを起動します。
+
+```yaml
+integration-test:
+  docker:
+    - image: cimg/python:3.14.8
+      environment:
+        REDIS_URL: redis://localhost:6379/0
+        MONGO_URI: mongodb://localhost:27017/
+    - image: redis:7
+    - image: mongo:7.0
+
+  resource_class: medium
+```
+
+RedisとMongoDBには、CircleCIジョブ内部の `localhost` から接続します。
+
+テストでは認証なしのローカルサービスを使用しています。
+
+この設定はCI専用であり、本番環境向けのセキュリティ構成ではありません。
+
+### 13.3 CircleCI設定エラーへの対応
+
+統合テスト追加時、CircleCIの設定ファイル解析で以下のエラーが発生しました。
+
+```text
+Error calling workflow: 'ci'
+Error calling job: 'integration-test'
+Unclosed '<<' tag
+('<<' must be escaped as '\<<' in config v2.1+)
+```
+
+原因は、CircleCIの設定ファイル内でPythonのヒアドキュメント構文を使用していたことです。
+
+修正前：
+
+```bash
+python - <<'PY'
+```
+
+CircleCI設定内での修正後：
+
+```bash
+python - \<<'PY'
+```
+
+`<<` のエスケープにより、設定エラーを解消しました。
+
+### 13.4 MongoDBのLinuxカーネル互換性問題
+
+最初の統合テストでは、MongoDB 8系のコンテナが起動できませんでした。
+
+エラーメッセージ：
+
+```text
+MongoDB cannot start:
+Linux kernel versions 6.19 and newer
+has a known incompatibility with this version of MongoDB.
+```
+
+CircleCIの実行環境とMongoDB 8系の組み合わせで互換性問題が発生したため、統合テスト専用のMongoDBを7.0系へ変更しました。
+
+修正前：
+
+```yaml
+- image: mongo:8
+```
+
+修正後：
+
+```yaml
+- image: mongo:7.0
+```
+
+この変更によってMongoDBの起動に成功しました。
+
+なお、ローカルkind環境ではMongoDB 8系を使用しています。
+
+そのため、CircleCI上のMongoDB 7.0系での成功は、MongoDB 8系との完全な動作互換性を保証するものではありません。
+
+### 13.5 Redis・MongoDBサービス連携テスト
+
+テストファイル：
+
+```text
+tests/integration/test_services.py
+```
+
+検証対象：
+
+1. Redisへの接続
+2. MongoDBへの接続
+3. Consumer Groupの作成
+4. Redis Streamsへのジョブ投入
+5. `XREADGROUP` によるメッセージ取得
+6. `save_result()` によるMongoDB保存
+7. 同一 `job_id` の再保存
+8. 保存件数が1件であることの確認
+9. `XACK` によるACK
+10. Pendingが0件であることの確認
+
+ジョブ識別にはUUIDを利用し、テスト対象データを分離しています。
+
+このテストは実際のRedisとMongoDBを使用しますが、Worker自体は起動しません。
+
+### 13.6 サービス連携テストの結果
+
+2026年10月21日のCircleCI実行結果：
+
+| 項目 | 結果 |
+| --- | --- |
+| CIジョブ | `integration-test` |
+| Redis | 7.4.11 |
+| MongoDB | 7.0系 |
+| サービス起動 | 成功 |
+| Redis・MongoDB接続 | 成功 |
+| 統合テスト | 1件成功 |
+| pytest実行時間 | 0.18秒 |
+| CIジョブ全体 | 11秒 |
+
+ログ：
+
+```text
+Redis and MongoDB are ready
+```
+
+```text
+1 passed in 0.18s
+```
+
+### 13.7 Workerを使用したE2E統合テスト
+
+2026年10月22日、サービス連携テストを拡張し、実際のWorkerを使用したE2E統合テストを追加しました。
+
+テストファイル：
+
+```text
+tests/integration/test_worker_e2e.py
+```
+
+このテストでは、`subprocess.Popen()` を利用してWorkerを別プロセスとして起動します。
+
+起動対象：
+
+```bash
+python -m src.worker
+```
+
+Workerの主な環境変数：
+
+```text
+REDIS_HOST=localhost
+MONGO_URI=mongodb://localhost:27017/
+READ_BATCH_SIZE=1
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+PYTHONUNBUFFERED=1
+```
+
+`REDIS_HOST` はWorker本体が参照する設定です。
+
+サービス連携テストで使用する `REDIS_URL` とは区別しています。
+
+### 13.8 E2E統合テストの処理フロー
+
+```mermaid
+flowchart TD
+    A[pytest起動]
+    B[Redis・MongoDB接続確認]
+    C[Workerプロセス起動]
+    D[Consumer Group作成確認]
+    E[Redis Streamsへジョブ投入]
+    F[Workerがジョブ取得]
+    G[PyTorch推論]
+    H[MongoDBへ結果保存]
+    I[保存スコアの確認]
+    J[Redis ACK / Pending 0確認]
+    K[Workerプロセス停止]
+    L[テストデータ削除]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+    H --> I
+    I --> J
+    J --> K
+    K --> L
+```
+
+投入するジョブ：
+
+```python
+redis_client.xadd(
+    "inference_jobs",
+    {
+        "job_id": job_id,
+        "input_value": "0.5",
+    },
+)
+```
+
+MongoDBに保存された結果について、以下を検証します。
+
+```python
+assert abs(document["score"] - 0.5) < 1e-5
+assert document["device"] == "cpu"
+```
+
+また、保存件数が1件であることと、Redis Pendingが0件であることを確認します。
+
+### 13.9 タイムアウトとプロセス終了処理
+
+Workerは通常、無限ループでジョブを待機する常駐プロセスです。
+
+CI上でテストが終了しなくなることを防ぐため、E2Eテストに制限時間を設けました。
+
+| 対象 | タイムアウト |
+| --- | ---: |
+| Worker起動・Consumer Group作成 | 60秒 |
+| MongoDB保存・ACK確認 | 45秒 |
+| Worker終了待機 | 5秒 |
+
+Workerが正常終了しない場合は、次の順序で停止処理を実行します。
+
+```python
+worker_process.terminate()
+
+try:
+    worker_process.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    worker_process.kill()
+    worker_process.wait(timeout=5)
+```
+
+`try/finally` により、テスト成功時・失敗時のどちらでもWorkerプロセスの停止処理を実行します。
+
+例外発生時にはWorkerの標準出力・標準エラーを表示し、原因を調査できるようにしました。
+
+また、終了処理でMongoDBのテストデータ削除とクライアント接続のクローズを行います。
+
+ただし、Pythonプロセスが強制終了された場合など、すべての異常条件で後片付けを保証するものではありません。
+
+### 13.10 CircleCIへのE2Eテスト組み込み
+
+E2EテストではPyTorchを使用するため、`integration-test` ジョブへPyTorch CPU版のインストール処理を追加しました。
+
+```yaml
+- run:
+    name: Install integration dependencies
+    command: |
+      python -m pip install \
+        torch==2.14.1+cpu \
+        --index-url https://download.pytorch.org/whl/cpu
+
+      python -m pip install \
+        "redis>=6,<7" \
+        "pymongo>=4,<5" \
+        pytest
+```
+
+統合テスト実行：
+
+```yaml
+- run:
+    name: Run integration tests
+    command: |
+      mkdir -p test-results
+      python -m pytest -q tests/integration \
+        --junitxml=test-results/integration.xml
+```
+
+テストレポートはJUnit XML形式で保存します。
+
+### 13.11 Worker E2E統合テストの結果
+
+2026年10月22日のCircleCI実行結果：
+
+| 項目 | 結果 |
+| --- | --- |
+| CIジョブ | `integration-test` |
+| ジョブ実行時間 | 1分6秒 |
+| 依存関係インストール | 46秒 |
+| Redis接続 | 成功 |
+| MongoDB接続 | 成功 |
+| サービス連携テスト | 成功 |
+| Worker E2E統合テスト | 成功 |
+| pytest実行件数 | 2件 |
+| pytest実行時間 | 2.24秒 |
+| テスト失敗 | 0件 |
+
+CircleCIログ：
+
+```text
+..                                    [100%]
+2 passed in 2.24s
+```
+
+これにより、実際のWorkerによるジョブ取得・PyTorch推論・MongoDB保存・Redis ACKまでの正常系処理をCircleCI上で確認できました。
+
+### 13.12 Phase 12の制約
+
+今回のE2E統合テストは、CI専用のRedis・MongoDBを使用した正常系1ジョブの検証です。
+
+以下の項目は検証対象外です。
+
+- Kubernetes上でのPod起動
+- Worker複数レプリカでの分散処理
+- MongoDB停止時の再試行
+- Worker停止後のPending再回収
+- DLQへの隔離処理
+- 高負荷時の性能・安定性
+- MongoDB 8系でのCI統合動作
+- 外部サービスとのネットワーク障害
+
+また、WorkerのStream名とConsumer Group名は固定値のため、E2EテストはCI専用のRedis環境で実行することを前提としています。
+
+共有環境や既存のkindクラスタに対して、このテストを無条件に実行しないよう注意が必要です。
+
+---
+
+## 14. CircleCI全体の構成（Phase 9〜12）
+
+2026年10月22日時点で、以下の4ジョブをCircleCIに構築しました。
+
+| ジョブ | 検証内容 | 確認結果 |
+| --- | --- | --- |
+| `test` | Python構文・Bash構文・単体テスト31件 | 成功 |
+| `docker-build` | Dockerビルド・PyTorch起動 | 成功 |
+| `k8s-validate` | Kubernetesマニフェスト9リソース | 成功 |
+| `integration-test` | Redis・MongoDB連携・Worker E2E | 2件成功 |
+
+ワークフロー設定：
+
+```yaml
+workflows:
+  ci:
+    jobs:
+      - test
+      - docker-build
+      - k8s-validate
+      - integration-test
+```
+
+4ジョブは独立して実行する構成です。
+
+### 14.1 CIで確認できる品質
+
+| 検証領域 | 実施内容 |
+| --- | --- |
+| ソースコード | Python・Bash構文チェック |
+| 単体テスト | pytest 31件 |
+| コンテナ | Dockerイメージのビルド・起動 |
+| 推論環境 | PyTorch CPU版のimport |
+| Kubernetes | Kubeconformによる静的スキーマ検証 |
+| Redis Streams | XADD・XREADGROUP・XACK |
+| MongoDB | 結果保存・重複防止 |
+| Worker E2E | 投入・推論・保存・ACK |
+| テスト結果 | JUnit XML・Artifacts保存 |
+
+これにより、非同期推論処理基盤について、コードの検証だけでなく、実サービスを利用した正常系のデータ処理まで自動テストできる状態になりました。
+
+### 14.2 今後の改善課題
+
+1. `integration-test` のPyTorch依存関係をキャッシュし、実行時間を短縮する。
+2. MongoDB停止時にACKされないことを検証する。
+3. Worker停止後のPending再回収を検証する。
+4. 再試行上限超過時のDLQ隔離を検証する。
+5. 複数Workerによる同時処理を検証する。
+6. Kubernetes上の統合テストを検討する。
+7. MongoDB 8系のCI実行環境との互換性を再検証する。
+8. テストカバレッジを計測する。
+9. Pull Request時のCI結果をマージ条件として利用する。
+10. CIの実行時間とクレジット消費を継続的に確認する。
+
+---
+
+## Phase 10〜12 まとめ
+
+Phase 10〜12では、CircleCIの検証範囲を次の順序で拡張しました。
+
+```text
+Python単体テスト
+    ↓
+Dockerイメージのビルド・起動
+    ↓
+Kubernetesマニフェストのスキーマ検証
+    ↓
+Redis・MongoDBのサービス連携テスト
+    ↓
+実際のWorkerによるE2E統合テスト
+```
+
+導入過程では、CircleCIのヒアドキュメント構文とMongoDBのLinuxカーネル互換性に起因する問題が発生しましたが、それぞれ原因を切り分けて対処しました。
+
+最終的に、実際のWorkerを使用したE2E統合テストで次の結果を確認しました。
+
+```text
+2 passed in 2.24s
+```
+
+**本PoCでは、GitHubへのpushを契機として、Pythonコード、Dockerイメージ、Kubernetes定義、およびRedis・MongoDBを利用した非同期推論処理の正常系までをCircleCIで自動検証できるようになりました。**
+
+今後は、正常系の確認に加えて、Worker停止やMongoDB障害といった異常系の自動検証を拡充していきます。
