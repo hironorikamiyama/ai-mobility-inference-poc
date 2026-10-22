@@ -1,7 +1,5 @@
 import os
-import subprocess
 import sys
-import tempfile
 import time
 import uuid
 
@@ -14,7 +12,7 @@ STREAM = "inference_jobs"
 GROUP = "inference_workers"
 
 
-def test_worker_reclaims_pending_message():
+def test_worker_reclaims_pending_message(worker_processes):
     suffix = uuid.uuid4().hex
     job_id = f"ci-recovery-{suffix}"
     consumer_a = f"ci-worker-a-{suffix}"
@@ -27,16 +25,20 @@ def test_worker_reclaims_pending_message():
         socket_connect_timeout=3,
     )
 
+    mongo_uri = os.getenv(
+        "MONGO_URI",
+        "mongodb://localhost:27017/",
+    )
+
     mongo_client = MongoClient(
-        os.getenv("MONGO_URI", "mongodb://localhost:27017/"),
+        mongo_uri,
         serverSelectionTimeoutMS=3000,
     )
 
     collection = mongo_client["ai_mobility"]["inference_results"]
 
-    worker_process = None
+    worker_b = None
     message_id = None
-    worker_log = tempfile.TemporaryFile(mode="w+t")
 
     try:
         assert redis_client.ping()
@@ -45,13 +47,16 @@ def test_worker_reclaims_pending_message():
         # Consumer Groupを準備
         try:
             redis_client.xgroup_create(
-                STREAM, GROUP, id="0", mkstream=True
+                STREAM,
+                GROUP,
+                id="0",
+                mkstream=True,
             )
         except ResponseError as exc:
             if "BUSYGROUP" not in str(exc):
                 raise
 
-        # ジョブを投入
+        # 1. Redis Streamsへジョブ投入
         message_id = redis_client.xadd(
             STREAM,
             {
@@ -60,7 +65,7 @@ def test_worker_reclaims_pending_message():
             },
         )
 
-        # Worker A相当のConsumerが受信する
+        # 2. Consumer Aが取得し、ACKせずPendingに残す
         messages = redis_client.xreadgroup(
             GROUP,
             consumer_a,
@@ -75,9 +80,9 @@ def test_worker_reclaims_pending_message():
         assert received_id == message_id
         assert fields["job_id"] == job_id
 
-        # ACKしないことでPendingを再現
         pending = redis_client.xpending_range(
-            STREAM, GROUP,
+            STREAM,
+            GROUP,
             min=message_id,
             max=message_id,
             count=1,
@@ -93,33 +98,21 @@ def test_worker_reclaims_pending_message():
             flush=True,
         )
 
-        # Worker Bを実際に起動
-        env = os.environ.copy()
-        env["REDIS_HOST"] = os.getenv(
-            "REDIS_HOST", "localhost"
-        )
-        env["MONGO_URI"] = os.getenv(
-            "MONGO_URI", "mongodb://localhost:27017/"
-        )
-        env["CONSUMER_NAME"] = consumer_b
-        env["READ_BATCH_SIZE"] = "1"
-        env["OMP_NUM_THREADS"] = "1"
-        env["MKL_NUM_THREADS"] = "1"
-        env["PYTHONUNBUFFERED"] = "1"
-        env["RECLAIM_IDLE_MS"] = "1000"
-
-        worker_process = subprocess.Popen(
-            [sys.executable, "-m", "src.worker"],
-            env=env,
-            stdout=worker_log,
-            stderr=subprocess.STDOUT,
+        # 3. 共通ヘルパーでWorker Bを起動
+        # CI専用の短縮設定（通常Workerの既定値は30秒）
+        worker_b = worker_processes(
+            consumer=consumer_b,
+            mongo_uri=mongo_uri,
+            reclaim_idle_ms=1000,
         )
 
-        # 30秒のアイドル期間を含めて再回収を待機
+        worker_b.wait_until_started()
+
+        # 4. Pending再回収・MongoDB保存・ACKを確認
         deadline = time.monotonic() + 20
 
         while time.monotonic() < deadline:
-            if worker_process.poll() is not None:
+            if worker_b.process.poll() is not None:
                 raise RuntimeError(
                     "Worker B exited unexpectedly"
                 )
@@ -127,7 +120,8 @@ def test_worker_reclaims_pending_message():
             document = collection.find_one({"_id": job_id})
 
             pending = redis_client.xpending_range(
-                STREAM, GROUP,
+                STREAM,
+                GROUP,
                 min=message_id,
                 max=message_id,
                 count=1,
@@ -136,9 +130,13 @@ def test_worker_reclaims_pending_message():
             if document is not None and not pending:
                 assert abs(document["score"] - 0.5) < 1e-5
                 assert document["device"] == "cpu"
+
                 assert collection.count_documents(
                     {"_id": job_id}
                 ) == 1
+
+                logs = worker_b.read_log()
+                assert f"Processed: job_id={job_id}" in logs
 
                 print(
                     f"Recovery succeeded: job_id={job_id}",
@@ -146,40 +144,32 @@ def test_worker_reclaims_pending_message():
                 )
                 break
 
-            time.sleep(0.5)
+            time.sleep(0.2)
         else:
             raise TimeoutError(
                 "Pending recovery or ACK timed out"
             )
 
-    except Exception:
-        # Workerログを停止後に出力できるようにする
-        raise
-
     finally:
-        if worker_process is not None:
-            if worker_process.poll() is None:
-                worker_process.terminate()
-                try:
-                    worker_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    worker_process.kill()
-                    worker_process.wait(timeout=5)
+        # データ削除より先にWorkerを停止
+        if worker_b is not None:
+            worker_b.stop()
 
-        worker_log.flush()
-        worker_log.seek(0)
-        logs = worker_log.read()
-
-        if sys.exc_info()[0] is not None:
+        if sys.exc_info()[0] is not None and worker_b is not None:
             print(
-                "\n=== Worker B log ===\n" + logs,
+                "\n=== Worker B log ===\n"
+                + worker_b.read_log(),
                 file=sys.stderr,
             )
 
+        # テストが作成したメッセージのみ後片付け
         if message_id is not None:
+            redis_client.xack(STREAM, GROUP, message_id)
             redis_client.xdel(STREAM, message_id)
 
         collection.delete_one({"_id": job_id})
+
         mongo_client.close()
         redis_client.close()
-        worker_log.close()
+
+        # Workerのログファイルはfixture側で閉じる
