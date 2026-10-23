@@ -106,6 +106,7 @@ def worker_processes():
             mongo_uri=mongo_uri,
             reclaim_idle_ms=reclaim_idle_ms,
             processing_delay_seconds=processing_delay_seconds,
+            pause_before_save_seconds=pause_before_save_seconds,
         )
         workers.append(worker)
         return worker
