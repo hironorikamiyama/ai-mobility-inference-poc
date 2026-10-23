@@ -1187,7 +1187,8 @@ git diff --stat
 | 12 | Redis・MongoDB・Worker正常系E2E | 完了 |
 | 13 | Pending再回収・MongoDB障害・DLQ | 完了 |
 | 14 | CI高速化・Worker管理共通化・安定性検証 | 完了 |
-
+| 15 | Workerプロセス強制終了・MongoDB保存前チェックポイント・Redis Pending再回収・統合テスト3回連続成功 | 完了 |
+| 16 | Kubernetes Worker Pod強制削除・Redis Pending再回収・MongoDB保存・ACK | 完了 |
 ---
 
 # 19. まとめ
@@ -1853,3 +1854,305 @@ Phase 15-3では、同一コミットで3回の繰り返し検証を実施し、
 これにより、**Workerが推論完了後・MongoDB保存前に異常終了した場合でも、Redis Pendingを通じて別Workerが処理を引き継ぎ、結果保存とACKまで完了できることを、実際のプロセス強制終了を用いて確認した。**
 
 今後は、Kubernetes環境でのPod強制終了や、Redis・MongoDBサービス障害を含む検証へ拡張する。
+
+
+---
+
+# Phase 16：Kubernetes Worker Pod強制削除・障害復旧検証
+
+## 目的
+
+Phase 15では、pytestから起動したPython Workerプロセスを強制終了し、Redis StreamsのPending再回収を検証した。
+
+Phase 16では、実際のKubernetes環境にWorkerを配置し、Pod強制削除後に別Workerが未ACKジョブを再処理できるか検証した。
+
+検証対象は以下の処理である。
+
+1. Worker AがRedis Streamsからジョブを取得
+2. PyTorch推論を実行
+3. MongoDB保存前チェックポイントに到達
+4. Worker A Podを強制削除
+5. Redis Pendingにジョブが保持される
+6. 別WorkerがPendingを再回収
+7. MongoDBへ推論結果を保存
+8. Redis ACKによってPendingを解消
+
+## 検証環境
+
+| 項目 | 内容 |
+| --- | --- |
+| 実施日 | 2026-10-23 |
+| OS | Windows / WSL2 |
+| Kubernetes | v1.37.0 |
+| クラスタ | kind / go-k8s-poc |
+| Namespace | ai-mobility-poc |
+| Worker | Python 3.14 / PyTorch CPU |
+| Redis | Redis Streams / Consumer Group |
+| MongoDB | StatefulSet / PVC |
+| テスト用イメージ | ai-mobility-inference-poc:phase16-crash-test |
+
+既存のRedis・MongoDBサービスを使用し、検証用Worker Podを別途作成した。
+
+既存データの削除、Redis Consumer Groupの再作成、MongoDBコレクションの初期化は行っていない。
+
+## 検証準備
+
+### Redisの初期状態
+
+障害注入前に以下を確認した。
+
+- Consumer Group：inference_workers
+- Redis Pending：0件
+- Consumer Group lag：0件
+- Redis Stream保存件数：2,535件
+
+Stream保存件数は既存メッセージの履歴数であり、未処理ジョブ件数ではない。
+
+### Dockerイメージ
+
+Phase 15で追加した保存前チェックポイントを含むイメージを作成した。
+
+```bash
+docker build \
+  -t ai-mobility-inference-poc:phase16-crash-test \
+  .
+
+kind load docker-image \
+  ai-mobility-inference-poc:phase16-crash-test \
+  --name go-k8s-poc
+```
+
+Workerのコード内に次の環境変数が存在することも確認した。
+
+`WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS`
+
+### Worker構成
+
+検証中は、既存の `inference-worker` Deploymentを一時的に0レプリカに変更し、テスト用Worker Aとジョブ取得が競合しないようにした。
+
+Worker Aの設定：
+
+| 設定 | 値 |
+| --- | --- |
+| Pod | phase16-worker-a |
+| Consumer | phase16-worker-a |
+| READ_BATCH_SIZE | 1 |
+| RECLAIM_IDLE_MS | 30000 |
+| WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS | 180 |
+| restartPolicy | Never |
+
+Worker AはPyTorch推論後、MongoDB保存前に180秒待機する。
+
+## 初回検証：手動によるPod強制削除
+
+最初の検証では、次のジョブを投入した。
+
+- JOB_ID：phase16-crash-20261023140838
+- Stream ID：1792732119197-0
+- input_value：0.5
+
+Worker Aのログで保存前チェックポイント到達を確認した。
+
+```text
+Before MongoDB save:
+job_id=phase16-crash-20261023140838,
+stream_id=1792732119197-0
+```
+
+チェックポイント確認時点では、Redis Pendingが1件、MongoDBは未保存だった。
+
+その後、Worker A Podの強制削除を実施したが、削除後の確認時点では次の結果となった。
+
+- Redis Pending：0件
+- MongoDB：保存済み
+- score：0.5
+- processed_at：2026-10-23 14:11:39 JST
+
+保存時刻がチェックポイント到達から約180秒後だったため、待機時間終了により通常処理が進んだ可能性が高い。
+
+ただし、Pod強制削除の正確な実行時刻とコンテナ終了時刻を記録していないため、処理の前後関係は断定できない。
+
+この初回実行は、障害復旧の成功例として扱わない。
+
+## 再検証：障害注入の自動化
+
+初回検証で手動操作の時間差が問題となったため、チェックポイントを検出した直後にPod削除を実行するスクリプトを作成した。
+
+検証スクリプト：
+
+`/tmp/phase16-kill-worker-a.sh`
+
+実行手順：
+
+1. 一意のJOB_IDを生成
+2. Redis Streamsへジョブを投入
+3. Worker Aのログを定期確認
+4. 対象ジョブの保存前チェックポイントを検出
+5. 直後にWorker A Podの強制削除を要求
+6. Redis PendingとMongoDB保存状態を確認
+
+Pod削除には次のコマンドを使用した。
+
+```bash
+kubectl delete pod phase16-worker-a \
+  -n ai-mobility-poc \
+  --grace-period=0 \
+  --force \
+  --wait=false
+```
+
+なお、このコマンドはKubernetes API上での即時削除を要求するものであり、コンテナプロセスが同時に終了したことまでは保証しない。
+
+## 再検証結果
+
+### テストジョブ
+
+| 項目 | 値 |
+| --- | --- |
+| JOB_ID | phase16-crash-20261023141624-retry |
+| Stream ID | 1792732584316-0 |
+| input_value | 0.5 |
+
+### Pod削除直後
+
+```text
+Checkpoint reached. Deleting Worker A immediately...
+
+pod "phase16-worker-a" force deleted
+
+Redis Pending:
+1
+
+Consumer:
+phase16-worker-a
+
+MongoDB:
+null
+```
+
+Worker Aの保存前チェックポイント到達後、Pod強制削除を実行した。
+
+削除直後の確認では、ジョブがRedis Pendingに残り、MongoDBは未保存だった。
+
+### 別Workerによる復旧
+
+今回の復旧処理は、専用Worker B Podではなく、再スケールした既存の `inference-worker` Deploymentが担当した。
+
+Worker AのPod削除後、既存Deploymentを1レプリカへ戻した。
+
+その後、既存Workerのログに対象ジョブの処理完了が記録された。
+
+```text
+Processed: job_id=phase16-crash-20261023141624-retry,
+stream_id=1792732584316-0,
+score=0.500000,
+elapsed_ms=4.25,
+queue_ms=30365.747,
+worker_ms=3.771,
+e2e_ms=30369.518,
+redis_wait_ms=30365.531,
+dispatch_wait_ms=0.216,
+tensor_ms=0.516,
+inference_ms=0.542,
+mongo_save_ms=2.690,
+ack=1
+```
+
+MongoDBには次の結果が保存された。
+
+```json
+{
+  "_id": "phase16-crash-20261023141624-retry",
+  "job_id": "phase16-crash-20261023141624-retry",
+  "input_value": 0.5,
+  "score": 0.5,
+  "device": "cpu"
+}
+```
+
+復旧後のRedis Pendingは0件となった。
+
+### 復旧処理の計測
+
+| 指標 | 実測値 |
+| --- | ---: |
+| E2E | 30,369.518 ms |
+| Redis待機 | 30,365.531 ms |
+| Worker処理 | 3.771 ms |
+| Tensor生成 | 0.516 ms |
+| PyTorch推論 | 0.542 ms |
+| MongoDB保存 | 2.690 ms |
+| Redis ACK | 1件 |
+
+今回のログでは、E2E時間の大部分をRedis待機時間が占めている。
+
+約30秒の待機時間は、Worker側のPending再回収設定のデフォルト値30,000msと整合している。
+
+ただし、単一のログからRedis待機時間の内訳やPod削除から復旧までの実際の経過時間を完全には確定できない。
+
+## 検証結果のまとめ
+
+| 検証項目 | 結果 |
+| --- | --- |
+| Kubernetes上でWorker A起動 | 成功 |
+| PyTorch推論完了後のチェックポイント到達 | 成功 |
+| Worker A Pod強制削除要求 | 成功 |
+| 削除直後のRedis Pending保持 | 成功 |
+| 削除直後のMongoDB未保存 | 成功 |
+| 別Workerによる再処理 | 成功 |
+| MongoDB結果保存 | 成功 |
+| Redis ACK | 成功 |
+| Redis Pending解消 | 成功 |
+| 既存Deployment復旧 | 成功 |
+
+## 検証終了後の環境状態
+
+検証終了後、以下を確認した。
+
+- inference-worker Deployment：1/1
+- redis Deployment：1/1
+- MongoDB Pod：Running
+- Redis Pending：0件
+- テスト専用Worker Pod：残存なし
+
+RedisとMongoDBの既存データは維持した。
+
+## 制約・未検証事項
+
+### 1. コンテナプロセスの終了時刻
+
+Podの強制削除要求とAPI上の削除を確認したが、コンテナプロセスが実際に終了した時刻までは計測していない。
+
+### 2. Deploymentによる自動復旧ではない
+
+今回の復旧Workerは、手動で1レプリカへ戻した既存Deploymentによって起動した。
+
+KubernetesがPod障害を検出し、Deploymentにより自動的に代替Podを作成するシナリオは検証していない。
+
+### 3. 固定時間ベースのチェックポイント
+
+保存前チェックポイントは180秒の待機処理を使用している。
+
+障害注入の自動化によって操作遅延を減らしたが、実行時刻の完全な同期は保証していない。
+
+### 4. 他サービスの障害
+
+Redisサーバーの停止、MongoDB Podの停止、Node障害、ネットワーク分断は今回の対象外とした。
+
+### 5. Exactly Once
+
+MongoDB保存には `_id=job_id` を用いた冪等保存を採用している。
+
+ただし、Redis Streamsの再処理が発生するため、Workerによる厳密なExactly Once実行は保証しない。
+
+## Phase 16の結論
+
+Kubernetes上で稼働するWorker AがPyTorch推論完了後・MongoDB保存前のチェックポイントに到達した状態で、Pod強制削除を実施した。
+
+削除直後にはRedis Pendingにジョブが残り、MongoDBは未保存だった。
+
+その後、別のWorker Podが対象ジョブを再処理し、MongoDB保存とRedis ACKまで完了した。
+
+以上より、今回のkind環境では、Worker Pod強制削除後にRedis StreamsのPendingを利用した再処理経路が機能することを確認できた。
+
+今後は、Deploymentによる自動Pod再作成やNode障害、Redis・MongoDB自体の障害を対象とした検証へ拡張する。

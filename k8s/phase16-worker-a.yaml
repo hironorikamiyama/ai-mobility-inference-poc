@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: phase16-worker-a
+  namespace: ai-mobility-poc
+  labels:
+    app: phase16-worker
+    role: worker-a
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: worker
+      image: ai-mobility-inference-poc:phase16-crash-test
+      imagePullPolicy: Never
+      command: ["python", "-m", "src.worker"]
+      env:
+        - name: REDIS_HOST
+          value: redis
+        - name: MONGO_URI
+          value: mongodb://mongo:27017/
+        - name: CONSUMER_NAME
+          value: phase16-worker-a
+        - name: READ_BATCH_SIZE
+          value: "1"
+        - name: RECLAIM_IDLE_MS
+          value: "30000"
+        - name: WORKER_PROCESSING_DELAY_SECONDS
+          value: "0"
+        - name: WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS
+          value: "180"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: OMP_NUM_THREADS
+          value: "1"
+        - name: MKL_NUM_THREADS
+          value: "1"
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
