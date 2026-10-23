@@ -14,6 +14,7 @@ class WorkerProcess:
         mongo_uri,
         reclaim_idle_ms=30000,
         processing_delay_seconds=0,
+        pause_before_save_seconds=0,
     ):
         self.consumer = consumer
         self.log = tempfile.TemporaryFile(mode="w+t")
@@ -30,6 +31,7 @@ class WorkerProcess:
             "MKL_NUM_THREADS": "1",
             "PYTHONUNBUFFERED": "1",
             "WORKER_PROCESSING_DELAY_SECONDS": str(processing_delay_seconds),
+            "WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS": str(pause_before_save_seconds),
             "RECLAIM_IDLE_MS": str(reclaim_idle_ms),
         })
 
@@ -97,6 +99,7 @@ def worker_processes():
         mongo_uri,
         reclaim_idle_ms=30000,
         processing_delay_seconds=0,
+        pause_before_save_seconds=0,
     ):
         worker = WorkerProcess(
             consumer=consumer,

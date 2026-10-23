@@ -74,7 +74,8 @@ def test_worker_crash_recovery(worker_processes):
             consumer=consumer_a,
             mongo_uri=mongo_uri,
             reclaim_idle_ms=30000,
-            processing_delay_seconds=10,
+            processing_delay_seconds=0,
+            pause_before_save_seconds=10,
         )
 
         worker_a.wait_until_started()
@@ -94,7 +95,12 @@ def test_worker_crash_recovery(worker_processes):
             flush=True,
         )
 
-        # 3. Worker Aが取得したことを確認
+         # 3. 推論完了・MongoDB保存直前への到達を確認
+        marker = (
+            f"Before MongoDB save: job_id={job_id}, "
+            f"stream_id={message_id}"
+        )
+
         deadline = time.monotonic() + 15
 
         while time.monotonic() < deadline:
@@ -104,46 +110,42 @@ def test_worker_crash_recovery(worker_processes):
                     + worker_a.read_log()
                 )
 
-            pending = get_pending(
-                redis_client,
-                message_id,
-            )
-
-            if pending:
-                assert pending[0]["consumer"] == consumer_a
-                assert pending[0]["times_delivered"] == 1
+            if marker in worker_a.read_log():
                 break
 
             time.sleep(0.1)
         else:
             raise TimeoutError(
-                "Worker A did not acquire the message"
+                "Worker A did not reach pre-save checkpoint"
             )
 
-        # 保存前の遅延が機能することを確認するため、
-        # 短時間経過後も未保存であることを確認
-        time.sleep(0.3)
+        pending = get_pending(redis_client, message_id)
 
-        assert worker_a.process.poll() is None
+        assert len(pending) == 1
+        assert pending[0]["consumer"] == consumer_a
+        assert pending[0]["times_delivered"] == 1
+
         assert collection.find_one({"_id": job_id}) is None
 
-        print(
-            "Worker A acquired the message; "
-            "MongoDB result is absent",
-            flush=True,
-        )
+        # 4. MongoDB保存直前でWorker Aを強制終了
+        assert worker_a.process.poll() is None
 
-        # 4. Worker Aを実際に強制終了
         worker_a.process.kill()
         worker_a.process.wait(timeout=5)
 
         assert worker_a.process.poll() is not None
 
         print(
-            f"Worker A killed: "
-            f"returncode={worker_a.process.returncode}",
+            "Worker A killed at pre-save checkpoint",
             flush=True,
         )
+
+        # 強制終了後もMongoDB未保存・Redis Pending保持
+        assert collection.find_one({"_id": job_id}) is None
+
+        pending = get_pending(redis_client, message_id)
+        assert len(pending) == 1
+        assert pending[0]["consumer"] == consumer_a
 
         # 5. 終了後もPendingが残っている
         pending = get_pending(

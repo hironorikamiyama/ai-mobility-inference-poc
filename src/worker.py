@@ -155,6 +155,19 @@ def process_message(
         time.perf_counter() - inference_started
     ) * 1000
 
+    # Phase 15-2: MongoDB保存直前のテスト用同期ポイント
+    pause_before_save = float(
+        os.getenv("WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS", "0")
+    )
+
+    if pause_before_save > 0:
+        print(
+            f"Before MongoDB save: job_id={job_id}, "
+            f"stream_id={message_id}",
+            flush=True,
+        )
+        time.sleep(pause_before_save)
+
     # MongoDB保存時間
     mongo_started = time.perf_counter()
 
