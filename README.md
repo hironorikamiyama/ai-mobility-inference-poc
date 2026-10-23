@@ -1209,3 +1209,647 @@ Phase 14では、統合テストの実行時間を76.11秒から平均21.99秒�
 **本PoCの主な成果は、非同期推論処理の正常系だけでなく、障害復旧と性能特性について、コード・ログ・自動テストに基づいて検証できる基盤を構築したことです。**
 
 今後は、より実運用に近い障害注入・負荷条件・Kubernetes環境で検証を拡張し、非機能要件に対する設計と評価の精度を高めていきます。
+
+
+---
+
+# 20. Phase 15：Worker強制終了・障害復旧テスト
+
+## 20.1 目的
+
+Phase 15では、非同期推論処理中にWorkerプロセスが異常終了した場合の復旧動作を検証した。
+
+これまでのPhase 13では、Redis StreamsのConsumer操作を利用してPending状態を再現し、別Workerによる再回収とMongoDB保存を検証していた。
+
+Phase 15では、実際に動作しているWorkerプロセスを強制終了し、次の処理が成立することを確認した。
+
+- Worker AがRedis Streamsからジョブを取得する
+- PyTorchによる推論処理を実行する
+- MongoDB保存前にWorker Aを強制終了する
+- Redis Pendingに未ACKジョブが残る
+- Worker BがXAUTOCLAIMによりPendingを再回収する
+- Worker BがPyTorch推論を再実行する
+- MongoDBへ推論結果が保存される
+- Redis ACKによってPendingが解消される
+
+本検証の目的は、Workerプロセスの突然の終了に対して、Redis Streamsを利用した再処理経路が機能することを確認することである。
+
+---
+
+## 20.2 検証対象
+
+### 使用技術
+
+| 項目 | 技術 |
+| --- | --- |
+| プログラミング言語 | Python 3.14 |
+| 推論処理 | PyTorch CPU |
+| メッセージ管理 | Redis Streams |
+| 結果保存 | MongoDB |
+| テスト | pytest |
+| CI | CircleCI |
+| Worker管理 | subprocess / WorkerProcess |
+
+### 関連ファイル
+
+| ファイル | 役割 |
+| --- | --- |
+| `src/worker.py` | 推論・MongoDB保存・Redis ACK |
+| `tests/integration/conftest.py` | Worker起動・停止・ログ管理 |
+| `tests/integration/test_worker_crash_recovery.py` | 強制終了・障害復旧の統合テスト |
+| `.circleci/config.yml` | CircleCI実行設定 |
+
+### 対象となるRedis Streams
+
+Stream：
+
+`inference_jobs`
+
+Consumer Group：
+
+`inference_workers`
+
+使用するRedisコマンド：
+
+- XADD
+- XREADGROUP
+- XPENDING
+- XAUTOCLAIM
+- XACK
+
+---
+
+## 20.3 障害復旧シナリオ
+
+今回のテストでは、Worker AとWorker Bの2つのプロセスを利用した。
+
+```text
+Producer
+   |
+   | XADD
+   v
+Redis Streams
+inference_jobs
+   |
+   | XREADGROUP
+   v
+Worker A
+   |
+   | PyTorch推論
+   v
+MongoDB保存直前
+   |
+   | テスト用チェックポイント
+   v
+Worker A 強制終了（SIGKILL）
+   |
+   v
+Redis Pendingにジョブ保持
+   |
+   | XAUTOCLAIM
+   v
+Worker B
+   |
+   | PyTorch再推論
+   v
+MongoDB保存
+   |
+   | XACK
+   v
+Pending解消
+```
+
+Worker Aはジョブを取得した後、MongoDB保存を行う前に強制終了される。
+
+RedisのConsumer Groupでは、取得済みでACKされていないメッセージがPendingとして残る。
+
+Worker BがそのPendingメッセージを再回収し、処理を継続する。
+
+---
+
+## 20.4 Phase 15-1：実際のWorker強制終了テスト
+
+### 実装内容
+
+新規統合テストとして、以下を作成した。
+
+`tests/integration/test_worker_crash_recovery.py`
+
+既存のWorkerProcess共通ヘルパーを使用し、Worker AおよびWorker Bの起動・停止・ログ取得を行う。
+
+Worker Aの起動例：
+
+```python
+worker_a = worker_processes(
+    consumer=consumer_a,
+    mongo_uri=mongo_uri,
+    reclaim_idle_ms=30000,
+    processing_delay_seconds=10,
+)
+
+worker_a.wait_until_started()
+```
+
+Redis Streamsへジョブを投入した後、Redis Pendingへの登録とMongoDB未保存状態を確認し、Worker Aを強制終了する。
+
+```python
+worker_a.process.kill()
+worker_a.process.wait(timeout=5)
+
+assert worker_a.process.poll() is not None
+```
+
+Worker Bは再回収時間を1,000msに設定して起動する。
+
+```python
+worker_b = worker_processes(
+    consumer=consumer_b,
+    mongo_uri=mongo_uri,
+    reclaim_idle_ms=1000,
+    processing_delay_seconds=0,
+)
+
+worker_b.wait_until_started()
+```
+
+Worker Bによる再回収・保存・ACKが完了すると、MongoDBに対象ジョブの結果が1件存在し、Redis Pendingから対象メッセージが消えることを確認する。
+
+### Phase 15-1の結果
+
+CircleCIで新規テストを含む統合テスト7件が成功した。
+
+```text
+7 passed in 25.43s
+```
+
+新規強制終了・復旧テストの実行時間：
+
+`3.54秒`
+
+この段階では、Worker AがRedisからジョブを取得したことは確認できたが、強制終了時に推論処理のどの地点まで到達していたかを厳密には確認できていなかった。
+
+そのため、Phase 15-2で保存直前のチェックポイントを追加した。
+
+---
+
+## 20.5 Phase 15-2：MongoDB保存直前のチェックポイント
+
+### 改善の目的
+
+Phase 15-1では、Redis Pending登録とMongoDB未保存を確認してWorker Aを停止していた。
+
+ただし、この条件だけでは、Worker AがPyTorch推論を完了したかどうか判断できない。
+
+そこで、PyTorch推論終了後、MongoDB保存直前にテスト用のチェックポイントを追加した。
+
+### Workerの処理順序
+
+```text
+Redisジョブ取得
+      |
+      v
+入力値の検証
+      |
+      v
+Tensor生成
+      |
+      v
+PyTorch推論
+      |
+      v
+保存前チェックポイント
+      |
+      v
+MongoDB保存
+      |
+      v
+Redis ACK
+```
+
+### チェックポイントの実装
+
+`src/worker.py` に、次の処理を追加した。
+
+```python
+# Phase 15-2: MongoDB保存直前のテスト用同期ポイント
+pause_before_save = float(
+    os.getenv("WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS", "0")
+)
+
+if pause_before_save > 0:
+    print(
+        f"Before MongoDB save: job_id={job_id}, "
+        f"stream_id={message_id}",
+        flush=True,
+    )
+    time.sleep(pause_before_save)
+```
+
+環境変数：
+
+`WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS`
+
+未設定の場合は0秒となり、追加の待機処理は実行されない。
+
+CIの強制終了テストでは、この値を10秒に設定する。
+
+通常のWorker実行時には、今回のチェックポイントによる待機は発生しない。
+
+### MongoDB保存時間の計測
+
+チェックポイントは、既存のMongoDB保存時間計測より前に配置した。
+
+```python
+# チェックポイント終了後に計測開始
+mongo_started = time.perf_counter()
+
+save_result(
+    collection=collection,
+    job_id=job_id,
+    input_value=input_value,
+    score=score,
+    device=worker.device.type,
+)
+
+mongo_save_ms = (
+    time.perf_counter() - mongo_started
+) * 1000
+```
+
+これにより、テスト用の待機時間が `mongo_save_ms` に含まれないようにしている。
+
+---
+
+## 20.6 WorkerProcess共通ヘルパーの拡張
+
+`tests/integration/conftest.py` のWorkerProcessに、保存前チェックポイントの設定を追加した。
+
+```python
+def __init__(
+    self,
+    consumer,
+    mongo_uri,
+    reclaim_idle_ms=30000,
+    processing_delay_seconds=0,
+    pause_before_save_seconds=0,
+):
+```
+
+Workerへ渡す環境変数：
+
+```python
+"WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS": str(
+    pause_before_save_seconds
+),
+```
+
+また、pytest fixtureからWorkerProcessへ設定値を渡すように変更した。
+
+```python
+def start(
+    consumer,
+    mongo_uri,
+    reclaim_idle_ms=30000,
+    processing_delay_seconds=0,
+    pause_before_save_seconds=0,
+):
+    worker = WorkerProcess(
+        consumer=consumer,
+        mongo_uri=mongo_uri,
+        reclaim_idle_ms=reclaim_idle_ms,
+        processing_delay_seconds=processing_delay_seconds,
+        pause_before_save_seconds=pause_before_save_seconds,
+    )
+
+    workers.append(worker)
+    return worker
+```
+
+これによってWorkerごとに保存前の待機時間を指定できる。
+
+### Worker Aの設定
+
+```python
+worker_a = worker_processes(
+    consumer=consumer_a,
+    mongo_uri=mongo_uri,
+    reclaim_idle_ms=30000,
+    processing_delay_seconds=0,
+    pause_before_save_seconds=10,
+)
+```
+
+Worker AはPyTorch推論後、MongoDB保存前に10秒間待機する。
+
+### Worker Bの設定
+
+```python
+worker_b = worker_processes(
+    consumer=consumer_b,
+    mongo_uri=mongo_uri,
+    reclaim_idle_ms=1000,
+    processing_delay_seconds=0,
+)
+```
+
+Worker Bには保存前待機を設定せず、Pending再回収と結果保存を実行させる。
+
+---
+
+## 20.7 チェックポイント到達確認
+
+テストでは、Worker Aのログに次の文字列が出力されるまで待機する。
+
+```text
+Before MongoDB save: job_id=..., stream_id=...
+```
+
+判定例：
+
+```python
+marker = (
+    f"Before MongoDB save: job_id={job_id}, "
+    f"stream_id={message_id}"
+)
+
+deadline = time.monotonic() + 15
+
+while time.monotonic() < deadline:
+    if worker_a.process.poll() is not None:
+        raise RuntimeError(
+            "Worker A exited unexpectedly:\n"
+            + worker_a.read_log()
+        )
+
+    if marker in worker_a.read_log():
+        break
+
+    time.sleep(0.1)
+else:
+    raise TimeoutError(
+        "Worker A did not reach pre-save checkpoint"
+    )
+```
+
+チェックポイント到達後、MongoDB未保存とRedis Pendingを確認してWorker Aを強制終了する。
+
+```python
+assert collection.find_one({"_id": job_id}) is None
+
+worker_a.process.kill()
+worker_a.process.wait(timeout=5)
+
+assert worker_a.process.poll() is not None
+```
+
+その後、Worker Bによる復旧を検証する。
+
+これにより、少なくともWorker AがPyTorch推論を完了し、MongoDB保存前のチェックポイントに到達したことを確認できる。
+
+---
+
+## 20.8 実装途中に発生した問題
+
+### 発生したエラー
+
+Phase 15-2の初回CircleCI実行では、次のエラーが発生した。
+
+```text
+TimeoutError:
+Worker A did not reach pre-save checkpoint
+```
+
+テスト結果：
+
+```text
+1 failed, 6 passed in 38.42s
+```
+
+Worker Aのログには次の記録が残っていた。
+
+```text
+Worker started: consumer=ci-crash-a-..., device=cpu
+Processed: job_id=ci-crash-..., score=0.500000, ... ack=1
+```
+
+Worker Aはチェックポイントで待機せず、MongoDB保存とRedis ACKまで完了していた。
+
+### 原因
+
+`tests/integration/conftest.py` のpytest fixtureで、受け取った `pause_before_save_seconds` がWorkerProcessへ渡されていなかった。
+
+修正前：
+
+```python
+worker = WorkerProcess(
+    consumer=consumer,
+    mongo_uri=mongo_uri,
+    reclaim_idle_ms=reclaim_idle_ms,
+    processing_delay_seconds=processing_delay_seconds,
+)
+```
+
+修正後：
+
+```python
+worker = WorkerProcess(
+    consumer=consumer,
+    mongo_uri=mongo_uri,
+    reclaim_idle_ms=reclaim_idle_ms,
+    processing_delay_seconds=processing_delay_seconds,
+    pause_before_save_seconds=pause_before_save_seconds,
+)
+```
+
+### 原因分析
+
+環境変数の定義とWorker起動時の指定は存在していた。
+
+しかし、fixtureからWorkerProcessへの引数の受け渡しが不足していたため、デフォルト値の0が使用されていた。
+
+この結果、Worker Aでチェックポイントが有効にならず、テストがタイムアウトした。
+
+### 対応結果
+
+引数の受け渡しを修正した後、CircleCIの統合テスト7件が成功した。
+
+```text
+7 passed in 25.24s
+```
+
+Worker強制終了・復旧テスト：
+
+`3.36秒`
+
+---
+
+## 20.9 Phase 15-3：繰り返し実行による安定性検証
+
+### 目的
+
+保存前チェックポイントとWorker強制終了テストが、同一条件で繰り返し成功するかを確認する。
+
+既存の成功実行を基準とし、CircleCIの `integration-test` を追加で2回再実行した。
+
+コードは変更せず、同一コミット・同一設定で合計3回検証した。
+
+### 実行結果
+
+| 実行 | pytest時間 | Worker強制終了・復旧 | CIジョブ全体 | 結果 |
+| --- | ---: | ---: | ---: | --- |
+| 1回目 | 25.24秒 | 3.36秒 | 81秒 | 7 passed |
+| 2回目 | 24.62秒 | 3.56秒 | 42秒 | 7 passed |
+| 3回目 | 27.46秒 | 4.38秒 | 82秒 | 7 passed |
+
+### 集計結果
+
+| 項目 | 結果 |
+| --- | ---: |
+| 実行回数 | 3回 |
+| 成功回数 | 3回 |
+| 失敗回数 | 0回 |
+| 観測成功率 | 100% |
+| pytest平均 | 25.77秒 |
+| pytest最短 | 24.62秒 |
+| pytest最長 | 27.46秒 |
+| pytest最大・最小差 | 2.84秒 |
+| Worker強制終了・復旧の平均 | 3.77秒 |
+
+### 評価
+
+3回とも統合テスト7件がすべて成功した。
+
+特に、次のシナリオで失敗は確認されなかった。
+
+- Worker強制終了からの復旧
+- MongoDB保存失敗時の未ACK
+- MongoDB復旧後の再処理
+- Redis Pending再回収
+- DLQ隔離
+- Worker正常系E2E
+
+今回の3回では、Worker強制終了・復旧テストの実行時間は3.36〜4.38秒の範囲だった。
+
+pytest全体は24.62〜27.46秒で推移した。
+
+CIジョブ全体の時間には42〜82秒の差があったが、その原因は今回の記録だけでは特定できていない。
+
+また、3回の成功は、今後フレーキーテストが発生しないことを保証するものではない。
+
+---
+
+## 20.10 Phase 15の受け入れ条件と結果
+
+| 要件 | 検証結果 |
+| --- | --- |
+| Worker AがRedisジョブを取得する | 成功 |
+| Worker AがPyTorch推論を完了する | 成功 |
+| MongoDB保存前チェックポイントに到達する | 成功 |
+| Worker Aを実際に強制終了する | 成功 |
+| 強制終了後もRedis Pendingが残る | 成功 |
+| 強制終了時点でMongoDB未保存 | 成功 |
+| Worker BがPendingを再回収する | 成功 |
+| Worker Bが推論結果を保存する | 成功 |
+| MongoDB保存結果が1件となる | 成功 |
+| Redis Pendingが解消する | 成功 |
+| 統合テスト7件を維持する | 成功 |
+| 同一条件で3回連続成功する | 成功 |
+
+---
+
+## 20.11 本検証の制約
+
+本テストは、実際のWorkerプロセスを強制終了する障害注入テストである。
+
+ただし、検証対象には次の制約がある。
+
+### 1. Kubernetes Podの強制終了ではない
+
+今回はpytestから起動したPython WorkerプロセスにSIGKILLを送信している。
+
+Kubernetes Podの削除・再起動・再スケジューリングは検証していない。
+
+### 2. 保存直前の待機は時間ベース
+
+保存前チェックポイントには `time.sleep()` を使用している。
+
+Worker Aがログを出力した後、一定時間が経過するとMongoDB保存へ進む。
+
+極端なCI遅延が発生した場合には、意図した停止位置を維持できない可能性がある。
+
+より厳密な障害注入には、外部イベントによって解除される同期ポイントなどが必要になる。
+
+### 3. Redisサーバー障害は対象外
+
+今回の障害対象はWorkerプロセスである。
+
+Redis自体の停止、データ消失、接続障害、フェイルオーバーは対象外とした。
+
+### 4. MongoDBサーバーの実停止は対象外
+
+MongoDBの保存失敗・復旧については、別の統合テストで接続失敗を模擬している。
+
+Phase 15では、実際のMongoDBサーバー停止や再起動は実施していない。
+
+### 5. Exactly Onceは保証しない
+
+本PoCはRedis Streamsの再配信を前提としている。
+
+MongoDB保存では `_id=job_id` を利用した冪等保存を採用しているが、Worker処理自体の厳密なExactly Once実行は保証しない。
+
+### 6. 長時間・高負荷での安定性は未検証
+
+今回の安定性確認は3回の繰り返し実行である。
+
+長時間稼働、大量ジョブ、高負荷状態、複数Workerによる同時再回収については追加検証が必要である。
+
+---
+
+## 20.12 今後の改善案
+
+### 障害注入ポイントの改善
+
+- 固定時間の待機からイベント同期方式への変更
+- 強制終了位置のより厳密な制御
+- Workerログ以外のチェックポイント記録方法の検討
+
+### Kubernetes障害復旧
+
+- Worker Podの強制終了
+- DeploymentによるPod再起動
+- Workerレプリカ間のPending再回収
+- Pod再スケジューリング時の状態確認
+
+### Redis・MongoDB障害
+
+- Redis停止・復旧
+- MongoDB停止・復旧
+- 接続障害中のWorker動作
+- 復旧後の再接続と処理再開
+
+### CI安定性
+
+- 繰り返し実行回数の追加
+- 統合テスト間のRedis Stream分離
+- Worker停止処理の追加検証
+- pytest実行時間の継続的な記録
+
+---
+
+## 20.13 Phase 15まとめ
+
+Phase 15では、実際のWorkerプロセスを強制終了し、Redis Pendingに残ったジョブを別Workerが再回収できることを検証した。
+
+Phase 15-1では、実際のプロセス異常終了とPending再回収の基本動作を確認した。
+
+Phase 15-2では、PyTorch推論後・MongoDB保存前にチェックポイントを設け、強制終了位置をより明確にした。
+
+実装途中では、pytest fixtureからWorkerProcessへの引数の受け渡し漏れによって、チェックポイントが機能しない問題が発生した。
+
+原因を特定して修正し、統合テスト7件の成功を確認した。
+
+Phase 15-3では、同一コミットで3回の繰り返し検証を実施し、すべての回で7件の統合テストが成功した。
+
+これにより、**Workerが推論完了後・MongoDB保存前に異常終了した場合でも、Redis Pendingを通じて別Workerが処理を引き継ぎ、結果保存とACKまで完了できることを、実際のプロセス強制終了を用いて確認した。**
+
+今後は、Kubernetes環境でのPod強制終了や、Redis・MongoDBサービス障害を含む検証へ拡張する。
