@@ -1189,6 +1189,8 @@ git diff --stat
 | 14 | CI高速化・Worker管理共通化・安定性検証 | 完了 |
 | 15 | Workerプロセス強制終了・MongoDB保存前チェックポイント・Redis Pending再回収・統合テスト3回連続成功 | 完了 |
 | 16 | Kubernetes Worker Pod強制削除・Redis Pending再回収・MongoDB保存・ACK | 完了 |
+| 17 | Kubernetes DeploymentによるPod自動再作成・Redis Pending再回収・MongoDB保存・ACK・Readiness Probe改善 | 完了 |
+| 18 | Kubernetes障害復旧時間の定量測定・3回の反復検証・集計JSON生成 | 完了 |
 ---
 
 # 19. まとめ
@@ -2332,3 +2334,100 @@ Worker処理時間には、テスト用の保存前待機30秒が含まれてい
 Kubernetes DeploymentがWorker Podを自動再作成し、代替WorkerがRedis Pendingの未ACKジョブを再回収してMongoDB保存とRedis ACKを完了することを確認した。
 
 これにより、Phase 16で手動操作が必要だったWorkerの再起動を、Kubernetesの自己修復機能によって自動化できることを検証した。
+
+
+---
+
+# Phase 18：Kubernetes障害復旧時間の定量測定
+
+## 目的
+
+Phase 17で確認したKubernetes DeploymentによるWorker Pod自動復旧について、復旧に要する時間を定量的に測定した。
+
+Pod削除要求から代替Podの生成、Ready到達、ジョブ復旧完了までを段階的に計測した。
+
+## 測定方法
+
+Pythonの `time.monotonic()` を用いて、以下の時点を記録した。
+
+- T0：旧Pod削除要求開始
+- T1：代替Podの作成を検出
+- T2：代替PodのReady状態を検出
+- T3：代替Workerによるジョブ処理完了を検出
+
+測定指標：
+
+- Pod再作成検出時間：T1 − T0
+- Pod Ready検出時間：T2 − T0
+- ジョブ復旧完了検出時間：T3 − T0
+- Ready後の処理完了時間：T3 − T2
+
+これらはkubectlを利用したポーリングによる観測値であり、Kubernetes内部のイベント発生時刻そのものではない。
+
+## 実装内容
+
+新規スクリプト：
+
+`scripts/phase18-measure-recovery.py`
+
+主な処理：
+
+1. 既存Workerの停止状態を確認
+2. Redis Pendingが0件であることを確認
+3. テストジョブ投入
+4. MongoDB保存前チェックポイント到達を確認
+5. 旧Podを強制削除
+6. Redis Pending保持・MongoDB未保存を確認
+7. 代替Podの生成とReady到達を計測
+8. ジョブ処理完了を計測
+9. MongoDB保存・Redis ACK・Pending解消を確認
+10. 計測結果をJSONに保存
+
+## 測定結果
+
+| 指標 | 1回目 | 2回目 | 3回目 | 平均 |
+| --- | ---: | ---: | ---: | ---: |
+| Pod再作成検出 | 4.291秒 | 5.827秒 | 8.495秒 | 6.204秒 |
+| Pod Ready検出 | 4.782秒 | 6.454秒 | 9.439秒 | 6.892秒 |
+| ジョブ復旧完了検出 | 35.208秒 | 38.631秒 | 39.171秒 | 37.670秒 |
+| Ready後の処理完了 | 30.426秒 | 32.177秒 | 29.732秒 | 30.778秒 |
+
+実行回数：3回  
+成功回数：3回  
+失敗回数：0回
+
+## 評価
+
+今回の3回では、Pod削除要求から代替PodのReady検出まで平均6.892秒だった。
+
+ジョブ復旧完了の検出までは平均37.670秒だった。
+
+ただし、代替WorkerにもMongoDB保存前のテスト用待機30秒が適用されるため、ジョブ復旧完了時間は通常運用時の復旧時間を表していない。
+
+また、今回のPodにはWorkerアプリケーション固有のReadiness Probeがないため、Pod ReadyとWorkerの処理可能状態は同義ではない。
+
+## 制約
+
+- Kubernetesイベントそのものの時刻ではなく、ポーリング検出時刻を計測
+- 旧Podの実際のコンテナ終了時刻は未計測
+- 復旧処理に30秒のテスト用待機を含む
+- 測定回数は3回
+- Node障害、Redis障害、MongoDB障害は対象外
+- 実運用の復旧時間やSLO達成を保証する結果ではない
+
+## 今後の改善
+
+- Workerの起動完了時刻の計測
+- アプリケーション固有のReadiness Probe導入
+- テスト用待機時間を除いた復旧時間の測定
+- Kubernetes Eventsとの時刻比較
+- 測定回数の追加と分散評価
+- CSV・Markdown形式による集計レポート生成
+
+## 結論
+
+Kubernetes DeploymentによるWorker Pod自動復旧について、代替Podの作成・Ready到達・ジョブ処理完了の各段階を計測できるようになった。
+
+3回の測定すべてでRedis Pending再回収、MongoDB保存、Redis ACKが成功した。
+
+Phase 17の機能検証から、Phase 18では障害復旧の時間特性を評価する段階へ進めることができた。
