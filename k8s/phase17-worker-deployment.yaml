@@ -1,0 +1,55 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phase17-worker
+  namespace: ai-mobility-poc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: phase17-worker
+  template:
+    metadata:
+      labels:
+        app: phase17-worker
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: worker
+          image: ai-mobility-inference-poc:phase16-crash-test
+          imagePullPolicy: Never
+          command:
+            - python
+            - -m
+            - src.worker
+          env:
+            - name: REDIS_HOST
+              value: redis
+            - name: MONGO_URI
+              value: mongodb://mongo:27017/
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: READ_BATCH_SIZE
+              value: "1"
+            - name: RECLAIM_IDLE_MS
+              value: "1000"
+            - name: WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS
+              value: "30"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

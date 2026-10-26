@@ -47,6 +47,7 @@ spec:
                 - "db.adminCommand({ping:1}).ok"
             initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 5
           volumeMounts:
             - name: data
               mountPath: /data/db

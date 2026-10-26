@@ -2156,3 +2156,179 @@ Kubernetes上で稼働するWorker AがPyTorch推論完了後・MongoDB保存前
 以上より、今回のkind環境では、Worker Pod強制削除後にRedis StreamsのPendingを利用した再処理経路が機能することを確認できた。
 
 今後は、Deploymentによる自動Pod再作成やNode障害、Redis・MongoDB自体の障害を対象とした検証へ拡張する。
+
+
+---
+
+# Phase 17：Kubernetes DeploymentによるWorker Pod自動復旧
+
+## 目的
+
+Phase 16ではWorker Podを強制削除した後、既存Deploymentを手動で再スケールし、Redis Pendingからの復旧を確認した。
+
+Phase 17では、Deploymentのレプリカ数を維持したままWorker Podを強制削除し、Kubernetesによる代替Podの自動作成と、アプリケーションによる未ACKジョブの再処理を検証した。
+
+## 検証環境
+
+- 実施日：2026年10月26日
+- Kubernetes：v1.37.0
+- クラスタ：kind / go-k8s-poc
+- Namespace：ai-mobility-poc
+- 推論：Python / PyTorch CPU
+- メッセージ管理：Redis Streams
+- 結果保存：MongoDB
+- テストイメージ：ai-mobility-inference-poc:phase16-crash-test
+
+## MongoDB Readiness Probe改善
+
+事前確認でMongoDBのReadiness Probeが断続的にタイムアウトしていることを確認した。
+
+既存設定ではmongoshによるpingの制限時間が1秒だったため、5秒へ変更した。
+
+```yaml
+readinessProbe:
+  exec:
+    command:
+      - mongosh
+      - --quiet
+      - --eval
+      - "db.adminCommand({ping:1}).ok"
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+```
+
+StatefulSet更新後、MongoDB Podの再作成とReady状態への復帰、ping応答を確認した。
+
+長期間にわたる安定性改善については継続観測が必要である。
+
+## Phase 17-2：Deploymentの自己修復確認
+
+検証専用Deploymentを1レプリカで起動し、Podを強制削除した。
+
+削除前Pod：
+
+`phase17-worker-7848d6bc97-nplwg`
+
+自動生成された代替Pod：
+
+`phase17-worker-7848d6bc97-5wsmh`
+
+レプリカ数を操作せず、新PodがRunningとなり、起動ログが出力されることを確認した。
+
+この段階ではRedisやMongoDBを使用せず、KubernetesのPod自動再作成機能だけを検証した。
+
+## Phase 17-3〜4：実際の推論Workerによる復旧
+
+検証専用Deploymentを実際のPython Workerへ切り替えた。
+
+主要設定：
+
+- replicas：1
+- CONSUMER_NAME：Pod名をDownward APIから取得
+- RECLAIM_IDLE_MS：1000ms
+- WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS：30秒
+- restartPolicy：DeploymentによるPod管理
+- imagePullPolicy：Never
+
+検証中は既存Workerを0レプリカとし、ジョブ取得の競合を防止した。
+
+### 障害注入
+
+`scripts/phase17-auto-recovery.sh` を作成し、次の処理を自動化した。
+
+1. Redis Streamsへテストジョブ投入
+2. WorkerのMongoDB保存前チェックポイントを検出
+3. 旧Podの強制削除
+4. Redis Pending・MongoDB未保存状態の確認
+5. 代替Podの自動生成を確認
+6. 代替Podの処理完了ログを確認
+7. Redis ACK・MongoDB保存・Pending解消を確認
+
+### テスト対象
+
+| 項目 | 値 |
+| --- | --- |
+| JOB_ID | phase17-recovery-20261026100643 |
+| Stream ID | 1792976804825-0 |
+| input_value | 0.5 |
+
+旧Pod：
+
+`phase17-worker-8556d79564-vl6vv`
+
+代替Pod：
+
+`phase17-worker-8556d79564-tgw62`
+
+### 障害直後の状態
+
+- 保存前チェックポイント：到達
+- Pod強制削除要求：成功
+- Redis Pending：1件
+- MongoDB：未保存（null）
+
+### 代替Podによる復旧
+
+代替Workerのログで次を確認した。
+
+```text
+Processed: job_id=phase17-recovery-20261026100643,
+stream_id=1792976804825-0,
+score=0.500000,
+ack=1
+```
+
+最終確認結果：
+
+- Deployment：1/1
+- Redis Pending：0件
+- MongoDB保存：成功
+- score：0.5
+- ACK：1件
+
+復旧中にDeploymentのレプリカ数を手動変更する操作は行わなかった。
+
+## 計測結果
+
+| 指標 | 実測値 |
+| --- | ---: |
+| E2E | 34,099.210 ms |
+| Redis待機 | 4,064.528 ms |
+| Worker処理 | 30,034.244 ms |
+| Tensor生成 | 0.646 ms |
+| PyTorch推論 | 0.670 ms |
+| MongoDB保存 | 32.637 ms |
+
+Worker処理時間には、テスト用の保存前待機30秒が含まれている。
+
+また、E2E時間はジョブ投入から保存までの計測であり、Pod削除から復旧までの時間を直接表すものではない。
+
+## Phase 17の検証結果
+
+| 検証項目 | 結果 |
+| --- | --- |
+| Pod強制削除 | 成功 |
+| Deploymentによる代替Pod自動作成 | 成功 |
+| 代替Workerの起動 | 成功 |
+| Redis Pending保持 | 成功 |
+| Pending再回収・再処理 | 成功 |
+| MongoDB保存 | 成功 |
+| Redis ACK | 成功 |
+| Pending解消 | 成功 |
+| 通常Workerへの切り戻し | 成功 |
+| Python単体テスト31件 | 成功 |
+
+## 制約
+
+- Pod強制削除後の旧コンテナの実際の終了時刻は未計測
+- Podの削除からReady復帰までの時間は未計測
+- 保存前チェックポイントには30秒の固定待機を使用
+- Redis・MongoDB自体の停止やNode障害は対象外
+- Worker処理の厳密なExactly Once実行は保証しない
+
+## 結論
+
+Kubernetes DeploymentがWorker Podを自動再作成し、代替WorkerがRedis Pendingの未ACKジョブを再回収してMongoDB保存とRedis ACKを完了することを確認した。
+
+これにより、Phase 16で手動操作が必要だったWorkerの再起動を、Kubernetesの自己修復機能によって自動化できることを検証した。
