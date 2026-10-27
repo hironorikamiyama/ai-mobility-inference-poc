@@ -1191,6 +1191,7 @@ git diff --stat
 | 16 | Kubernetes Worker Pod強制削除・Redis Pending再回収・MongoDB保存・ACK | 完了 |
 | 17 | Kubernetes DeploymentによるPod自動再作成・Redis Pending再回収・MongoDB保存・ACK・Readiness Probe改善 | 完了 |
 | 18 | Kubernetes障害復旧時間の定量測定・3回の反復検証・集計JSON生成 | 完了 |
+| 19 | Kubernetes障害復旧時間の統計集計・CSV/Markdownレポート自動生成・入力値検証・pytest15件 | 完了 |
 ---
 
 # 19. まとめ
@@ -2431,3 +2432,69 @@ Kubernetes DeploymentによるWorker Pod自動復旧について、代替Podの�
 3回の測定すべてでRedis Pending再回収、MongoDB保存、Redis ACKが成功した。
 
 Phase 17の機能検証から、Phase 18では障害復旧の時間特性を評価する段階へ進めることができた。
+
+
+---
+
+## Phase 19：Kubernetes障害復旧時間の集計・レポート自動生成
+
+### 目的
+
+Phase 18で取得した障害復旧時間の測定結果を再利用し、複数回の測定結果を自動集計する仕組みを実装した。
+
+### 実装内容
+
+- JSON形式の測定結果を一括読み込み
+- 成功件数・失敗件数の集計
+- 平均・中央値・最小値・最大値・標本標準偏差の算出
+- 失敗記録を性能統計の計算対象から除外
+- 負数・NaN・Infinityなどの不正測定値を検出
+- JSON・CSV・Markdown形式のレポートを自動生成
+- pytestによる正常系・異常系の検証
+
+### 実行方法
+
+```bash
+python scripts/phase19-recovery-report.py \
+  --input output/phase18 \
+  --output output/phase19
+```
+
+### 測定結果
+
+| 指標 | 平均（秒） | 中央値（秒） | 標準偏差（秒） |
+| --- | ---: | ---: | ---: |
+| Pod再作成検出 | 6.204 | 5.827 | 2.127 |
+| Pod Ready検出 | 6.892 | 6.454 | 2.359 |
+| ジョブ復旧完了検出 | 37.670 | 38.631 | 2.149 |
+| Ready後の処理完了 | 30.778 | 30.426 | 1.260 |
+
+### 成果物
+
+- `scripts/phase19-recovery-report.py`
+- `tests/test_phase19_recovery_report.py`
+- `output/phase19/summary.json`
+- `output/phase19/recovery-results.csv`
+- `output/phase19/recovery-report.md`
+
+※ `output/` 配下はローカル生成物であり、GitHubへの登録対象とは限らない。
+
+### テスト結果
+
+- Phase 19専用テスト：15件成功
+- 単体テスト全体：46件成功
+- Phase 18の実測JSONを使用した回帰確認：成功
+
+### 制約・今後の課題
+
+- 復旧時間にはテスト用の30秒待機を含む
+- Kubernetesイベントの実発生時刻ではなくポーリングによる観測値
+- 測定件数3件のため、p95などの評価には使用しない
+- 測定レポートの自動生成は可能だが、復旧時間の合否判定は未実装
+
+### 結論
+
+Phase 18の測定データを自動集計し、JSON・CSV・Markdownの3形式で出力できるようになった。
+
+これにより、障害復旧試験の実行から測定結果の保存、統計集計、レポート生成までをPythonで処理できる基盤を構築した。
+```
