@@ -1192,6 +1192,8 @@ git diff --stat
 | 17 | Kubernetes DeploymentによるPod自動再作成・Redis Pending再回収・MongoDB保存・ACK・Readiness Probe改善 | 完了 |
 | 18 | Kubernetes障害復旧時間の定量測定・3回の反復検証・集計JSON生成 | 完了 |
 | 19 | Kubernetes障害復旧時間の統計集計・CSV/Markdownレポート自動生成・入力値検証・pytest15件 | 完了 |
+| 20 | 測定条件に基づく復旧時間のPoC閾値評価 | 完了 |
+| 21 | 旧Pod・代替Podの測定条件記録・一致確認・Phase 20連携の実クラスタ検証（3件） | 完了 |
 ---
 
 # 19. まとめ
@@ -2514,4 +2516,58 @@ python scripts/phase20-slo-evaluation.py \
 
 JSONとMarkdownの評価結果を `output/phase20/` に作成する。Phase 18/19の測定値や既存レポートは変更しない。
 
-設定ファイルの閾値はPoCの例示値であり、正式な本番SLOではない。Phase 18の測定JSONとPhase 19の集計JSONには測定条件が記録されていないため、そのまま評価すると `INCONCLUSIVE` になる。測定データ側に設定と一致する測定条件が明示され、比較対象の平均値と最低サンプル数も満たされた場合のみ、閾値との比較を行う。Phase 18のジョブ復旧測定にはテスト用30秒待機が含まれ、ポーリング観測値およびアプリケーション固有Readiness Probeがない点も評価条件に含める。
+設定ファイルの閾値はPoCの例示値であり、正式な本番SLOではない。Phase 20の実装時点ではPhase 18/19の測定条件が不足していたため、そのデータをそのまま評価すると `INCONCLUSIVE` となる。Phase 21では旧Podと代替Podそれぞれの条件を記録し、測定条件が設定と一致し、比較対象の平均値と最低サンプル数も満たされた場合のみ閾値を評価する。不一致や取得不能時は比較不能として `INCONCLUSIVE` を返す。
+
+---
+
+## Phase 21：測定条件の記録とSLO評価連携
+
+### 測定方法
+
+Phase 18で旧Worker Podの削除前と代替PodのReady検出後に、それぞれworkerコンテナの実効`WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS`とPod定義の`readinessProbe`を取得する。条件・取得不能理由・Pod名・条件取得時刻を測定JSONに保存し、2つのPodの必須条件がすべて既知かつ一致する場合のみ比較可能とする。条件取得時刻（`collected_at`）は観測時刻であり、コンテナ終了時刻を示すものではない。
+
+Phase 19で3件の測定結果を集計し、全測定で条件が一致することを確認した後、Phase 20で平均値をPoC用閾値と比較した。条件の不一致・欠損・取得失敗がある場合はPhase 19が比較不能の理由を記録し、Phase 20は閾値評価を行わず`INCONCLUSIVE`とする。旧形式JSONは読み込み可能だが、旧Pod・代替Pod双方の条件比較ができないため比較不能となる。
+
+```bash
+python scripts/phase18-measure-recovery.py
+python scripts/phase19-recovery-report.py \
+  --input output/phase18 \
+  --output output/phase19
+python scripts/phase20-slo-evaluation.py \
+  --input output/phase19/summary.json \
+  --config config/phase20-slo.json \
+  --output output/phase20
+```
+
+### 実クラスタ検証結果
+
+| 指標 | 平均実測値 | PoC閾値 | 結果 |
+| --- | ---: | ---: | --- |
+| Pod再作成検出 | 5.277秒 | 10秒 | PASS |
+| Pod Ready検出 | 5.736秒 | 15秒 | PASS |
+| ジョブ復旧完了検出 | 36.208秒 | 45秒 | PASS |
+| Ready後の処理完了 | 30.472秒 | 35秒 | PASS |
+
+- 測定成功：3/3
+- 測定条件比較可能：`true`
+- 総合評価：**PASS**
+
+### 測定条件
+
+3回の測定で旧Podと代替Podの条件一致を確認し、Phase 20設定と比較した。
+
+| 条件 | 記録値 |
+| --- | --- |
+| 障害シナリオ | `worker_pod_deletion` |
+| 測定方法 | `kubectl_polling_observation` |
+| `WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS` | 30秒 |
+| ジョブ復旧時間へのテスト用待機の包含 | 含む |
+| WorkerのReadiness Probe | なし |
+
+### 制約・注意事項
+
+- 今回の閾値はPoC検証用の例示値であり、実運用のSLOではない。今回のPASSは本番SLO達成を保証しない。
+- ジョブ復旧時間およびReady後の処理完了時間には、テスト用の30秒待機が含まれる。
+- 時刻はKubernetesイベントの実発生時刻ではなく、`kubectl`によるポーリングで状態を観測した値である。
+- 測定は3件のため、p95などの高パーセンタイル評価には十分でない。
+- 既存のPhase 18〜20の説明・記録を維持し、今回のPhase 21記載はこれらに追記した。

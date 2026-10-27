@@ -32,6 +32,38 @@ def make_record(job_id, status="passed", value=5.0):
     return record
 
 
+def make_conditions(**overrides):
+    conditions = {
+        "failure_scenario": "worker_pod_deletion",
+        "measurement_method": "kubectl_polling_observation",
+        "test_pause_seconds": 30.0,
+        "job_recovery_includes_test_pause": True,
+        "worker_readiness_probe": False,
+    }
+    conditions.update(overrides)
+    return conditions
+
+
+def add_verified_conditions(record, conditions):
+    record["measurement_conditions"] = conditions
+    record["measurement_conditions_comparable"] = True
+    record["measurement_conditions_reason"] = (
+        "All required measurement conditions are known and identical."
+    )
+    record["measurement_conditions_observations"] = {
+        key: {
+            "pod_name": pod_name,
+            "collected_at": "2026-10-27T00:00:00+00:00",
+            "conditions": dict(conditions),
+            "reasons": {},
+        }
+        for key, pod_name in (
+            ("old_pod", "worker-old"),
+            ("replacement_pod", "worker-new"),
+        )
+    }
+
+
 def test_summarize_three_passed_records():
     records = [
         make_record("job1", value=4.0),
@@ -51,6 +83,90 @@ def test_summarize_three_passed_records():
     assert result["min"] == 4.0
     assert result["max"] == 8.0
     assert result["stdev"] == 2.0
+
+
+def test_summarize_identical_known_conditions():
+    records = [
+        make_record("job1"),
+        make_record("job2"),
+    ]
+    for record in records:
+        add_verified_conditions(record, make_conditions())
+
+    summary = report.summarize(records)
+
+    assert summary["measurement_conditions_comparable"] is True
+    assert summary["measurement_conditions"] == make_conditions()
+    assert "identical, known" in summary["measurement_conditions_reason"]
+
+
+def test_summarize_condition_mismatch_as_incomparable():
+    first = make_record("job1")
+    second = make_record("job2")
+    add_verified_conditions(first, make_conditions())
+    add_verified_conditions(
+        second,
+        make_conditions(test_pause_seconds=0),
+    )
+
+    summary = report.summarize([first, second])
+
+    assert summary["measurement_conditions_comparable"] is False
+    assert "measurement_conditions" not in summary
+    assert "test_pause_seconds differs" in summary["measurement_conditions_reason"]
+
+
+def test_summarize_missing_conditions_as_incomparable():
+    record = make_record("legacy")
+
+    summary = report.summarize([record])
+
+    assert summary["measurement_conditions_comparable"] is False
+    assert "measurement_conditions" not in summary
+    assert "not verified comparable" in summary["measurement_conditions_reason"]
+
+
+def test_summarize_unknown_condition_includes_collection_reason():
+    record = make_record("unknown")
+    record["measurement_conditions_comparable"] = False
+    record["measurement_conditions_reason"] = (
+        "Measurement conditions are unknown: replacement_pod/test_pause_seconds: "
+        "Environment variable is not set."
+    )
+
+    summary = report.summarize([record])
+
+    assert summary["measurement_conditions_comparable"] is False
+    assert "measurement_conditions" not in summary
+    assert "Environment variable is not set." in (
+        summary["measurement_conditions_reason"]
+    )
+
+
+def test_summarize_respects_phase18_incomparable_flag():
+    record = make_record("mismatch")
+    add_verified_conditions(record, make_conditions())
+    record["measurement_conditions_comparable"] = False
+    record["measurement_conditions_reason"] = (
+        "Measurement conditions differ between old and replacement Pods: "
+        "worker_readiness_probe"
+    )
+
+    summary = report.summarize([record])
+
+    assert summary["measurement_conditions_comparable"] is False
+    assert "measurement_conditions" not in summary
+    assert "worker_readiness_probe" in summary["measurement_conditions_reason"]
+
+
+def test_legacy_record_with_only_one_pod_conditions_is_not_comparable():
+    record = make_record("phase21-legacy")
+    record["measurement_conditions"] = make_conditions()
+
+    summary = report.summarize([record])
+
+    assert summary["measurement_conditions_comparable"] is False
+    assert "measurement_conditions" not in summary
 
 
 def test_failed_record_excluded_from_statistics():

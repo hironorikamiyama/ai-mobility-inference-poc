@@ -292,6 +292,91 @@ def test_phase19_summary_schema_remains_compatible():
     assert "measurement_conditions" not in phase19_summary
 
 
+def summarize_phase19_records(config, *, value, include_conditions=True):
+    phase19_script = ROOT / "scripts" / "phase19-recovery-report.py"
+    phase19_spec = importlib.util.spec_from_file_location(
+        "phase19_recovery_report_for_phase20_chain_test",
+        phase19_script,
+    )
+    phase19 = importlib.util.module_from_spec(phase19_spec)
+    phase19_spec.loader.exec_module(phase19)
+
+    records = []
+    for index in range(3):
+        record = {
+            "job_id": f"job-{index}",
+            "status": "passed",
+            "measurements_seconds": {
+                name: value for name in phase19.METRICS
+            },
+            "measurement_conditions_comparable": True,
+            "measurement_conditions_reason": (
+                "All required measurement conditions are known and identical."
+            ),
+            "measurement_conditions_observations": {
+                key: {
+                    "pod_name": pod_name,
+                    "collected_at": "2026-10-27T00:00:00+00:00",
+                    "conditions": dict(config["measurement_conditions"]),
+                    "reasons": {},
+                }
+                for key, pod_name in (
+                    ("old_pod", "worker-old"),
+                    ("replacement_pod", "worker-new"),
+                )
+            },
+        }
+        if include_conditions:
+            record["measurement_conditions"] = dict(
+                config["measurement_conditions"]
+            )
+        else:
+            record.pop("measurement_conditions_observations")
+            record["measurement_conditions_comparable"] = False
+            record["measurement_conditions_reason"] = (
+                "measurement_conditions is missing"
+            )
+        records.append(record)
+    return phase19.summarize(records)
+
+
+def test_phase19_matching_conditions_flow_to_phase20_pass():
+    config = load_default_config()
+    summary = summarize_phase19_records(config, value=5)
+
+    report = slo.evaluate(summary, config)
+
+    assert summary["measurement_conditions_comparable"] is True
+    assert report["overall_status"] == "PASS"
+
+
+def test_phase19_matching_conditions_flow_to_phase20_fail():
+    config = load_default_config()
+    summary = summarize_phase19_records(config, value=100)
+
+    report = slo.evaluate(summary, config)
+
+    assert summary["measurement_conditions_comparable"] is True
+    assert report["overall_status"] == "FAIL"
+
+
+def test_phase19_unknown_conditions_flow_to_phase20_inconclusive():
+    config = load_default_config()
+    summary = summarize_phase19_records(
+        config,
+        value=1,
+        include_conditions=False,
+    )
+
+    report = slo.evaluate(summary, config)
+
+    assert summary["measurement_conditions_comparable"] is False
+    assert report["overall_status"] == "INCONCLUSIVE"
+    assert "measurement_conditions is missing" in (
+        report["metrics"]["pod_ready_observed"]["reason"]
+    )
+
+
 def test_non_required_fail_does_not_override_required_passes():
     config = load_default_config()
     summary = make_summary(config, value=5)

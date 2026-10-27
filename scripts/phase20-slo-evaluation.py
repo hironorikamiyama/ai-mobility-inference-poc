@@ -142,10 +142,26 @@ def evaluate(summary, config):
 
     expected_conditions = config["measurement_conditions"]
     observed_conditions = summary.get("measurement_conditions")
+    conditions_comparable = summary.get("measurement_conditions_comparable")
+    conditions_reason = summary.get("measurement_conditions_reason")
     conditions_agree = conditions_match(
         expected_conditions,
         observed_conditions,
     )
+    if conditions_comparable is False:
+        conditions_agree = False
+    elif conditions_comparable is not None and conditions_comparable is not True:
+        conditions_agree = False
+
+    if (
+        conditions_comparable is not False
+        or not isinstance(conditions_reason, str)
+        or not conditions_reason.strip()
+    ):
+        conditions_reason = (
+            "Measurement conditions are missing or do not exactly match "
+            "the configured conditions."
+        )
 
     sample_count = summary.get("passed_runs")
     if (
@@ -173,7 +189,7 @@ def evaluate(summary, config):
         }
 
         if not conditions_agree:
-            result["reason"] = "Measurement conditions are missing or do not exactly match the configured conditions."
+            result["reason"] = conditions_reason
         elif sample_count is None:
             result["reason"] = "The passed-run sample count is missing or invalid."
         elif sample_count < config["minimum_samples"]:

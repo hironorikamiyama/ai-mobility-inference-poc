@@ -2,6 +2,7 @@
 """Phase 18: Kubernetes Worker recovery timing."""
 
 import json
+import math
 import subprocess
 import time
 import uuid
@@ -18,6 +19,15 @@ POLL_INTERVAL = 0.2
 CHECKPOINT_TIMEOUT = 25
 POD_TIMEOUT = 120
 RECOVERY_TIMEOUT = 150
+TEST_PAUSE_ENV = "WORKER_TEST_PAUSE_BEFORE_SAVE_SECONDS"
+MISSING_ENV_SENTINEL = "__PHASE18_MISSING_ENV__"
+CONDITION_KEYS = (
+    "failure_scenario",
+    "measurement_method",
+    "test_pause_seconds",
+    "job_recovery_includes_test_pause",
+    "worker_readiness_probe",
+)
 
 
 def run(*args, check=True):
@@ -29,8 +39,8 @@ def run(*args, check=True):
     )
 
 
-def kubectl(*args):
-    return run("kubectl", "-n", NS, *args)
+def kubectl(*args, check=True):
+    return run("kubectl", "-n", NS, *args, check=check)
 
 
 def pod_names():
@@ -54,6 +64,190 @@ def pod_ready(name):
         and condition["status"] == "True"
         for condition in pod["status"].get("conditions", [])
     )
+
+
+def collect_measurement_conditions(pod_name):
+    conditions = {
+        "failure_scenario": "worker_pod_deletion",
+        "measurement_method": "kubectl_polling_observation",
+        "test_pause_seconds": None,
+        "job_recovery_includes_test_pause": None,
+        "worker_readiness_probe": None,
+    }
+    reasons = {}
+
+    try:
+        pod_result = kubectl(
+            "get", "pod", pod_name, "-o", "json", check=False
+        )
+    except OSError as exc:
+        reasons["worker_readiness_probe"] = (
+            "Could not read the target Pod container definition: "
+            + str(exc)
+        )
+    else:
+        if pod_result.returncode != 0:
+            reasons["worker_readiness_probe"] = (
+                "Could not read the target Pod container definition: "
+                + pod_result.stderr.strip()
+            )
+        else:
+            try:
+                pod = json.loads(pod_result.stdout)
+            except json.JSONDecodeError as exc:
+                reasons["worker_readiness_probe"] = (
+                    "Could not parse the target Pod container definition: "
+                    + str(exc)
+                )
+            else:
+                containers = pod.get("spec", {}).get("containers", [])
+                worker = next(
+                    (
+                        container for container in containers
+                        if container.get("name") == "worker"
+                    ),
+                    None,
+                )
+                if worker is None:
+                    reasons["worker_readiness_probe"] = (
+                        "The target Pod does not define a worker container."
+                    )
+                else:
+                    conditions["worker_readiness_probe"] = (
+                        "readinessProbe" in worker
+                    )
+
+    try:
+        pause_result = kubectl(
+            "exec",
+            pod_name,
+            "-c",
+            "worker",
+            "--",
+            "python",
+            "-c",
+            (
+                "import os; "
+                f"print(os.environ.get({TEST_PAUSE_ENV!r}, "
+                f"{MISSING_ENV_SENTINEL!r}))"
+            ),
+            check=False,
+        )
+    except OSError as exc:
+        reasons["test_pause_seconds"] = (
+            "Could not read the test-pause environment variable from the "
+            "target Pod: " + str(exc)
+        )
+    else:
+        if pause_result.returncode != 0:
+            reasons["test_pause_seconds"] = (
+                "Could not read the test-pause environment variable from the "
+                "target Pod: " + pause_result.stderr.strip()
+            )
+        else:
+            raw_pause = pause_result.stdout.strip()
+            if raw_pause == MISSING_ENV_SENTINEL:
+                reasons["test_pause_seconds"] = (
+                    f"{TEST_PAUSE_ENV} is not set in the target Pod."
+                )
+            else:
+                try:
+                    pause_seconds = float(raw_pause)
+                except ValueError:
+                    reasons["test_pause_seconds"] = (
+                        f"{TEST_PAUSE_ENV} is not a valid number: {raw_pause!r}."
+                    )
+                else:
+                    if not math.isfinite(pause_seconds) or pause_seconds < 0:
+                        reasons["test_pause_seconds"] = (
+                            f"{TEST_PAUSE_ENV} must be finite and non-negative; "
+                            f"got {raw_pause!r}."
+                        )
+                    else:
+                        conditions["test_pause_seconds"] = pause_seconds
+                        conditions["job_recovery_includes_test_pause"] = (
+                            pause_seconds > 0
+                        )
+
+    if conditions["job_recovery_includes_test_pause"] is None:
+        reasons["job_recovery_includes_test_pause"] = (
+            "Cannot determine whether the job recovery includes the test pause "
+            "because its effective duration is unknown."
+        )
+
+    return conditions, reasons
+
+
+def collect_pod_measurement_conditions(pod_name):
+    conditions, reasons = collect_measurement_conditions(pod_name)
+    return {
+        "pod_name": pod_name,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "conditions": conditions,
+        "reasons": reasons,
+    }
+
+
+def compare_measurement_conditions(old_observation, new_observation):
+    unknown = []
+    observations = (
+        ("old_pod", old_observation),
+        ("replacement_pod", new_observation),
+    )
+    known_conditions = {}
+
+    for label, observation in observations:
+        conditions = observation.get("conditions", {})
+        reasons = observation.get("reasons", {})
+        if not isinstance(conditions, dict):
+            unknown.append(f"{label}: conditions are missing")
+            continue
+        if not isinstance(reasons, dict):
+            reasons = {}
+
+        for key in CONDITION_KEYS:
+            value = conditions.get(key)
+            if key in ("failure_scenario", "measurement_method"):
+                valid = isinstance(value, str) and bool(value.strip())
+            elif key == "test_pause_seconds":
+                try:
+                    valid = (
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                        and value >= 0
+                    )
+                except OverflowError:
+                    valid = False
+            else:
+                valid = isinstance(value, bool)
+            if not valid:
+                unknown.append(
+                    f"{label}/{key}: "
+                    f"{reasons.get(key, 'condition is missing or invalid')}"
+                )
+        known_conditions[label] = conditions
+
+    if unknown:
+        return False, "Measurement conditions are unknown: " + "; ".join(unknown)
+
+    old_conditions = known_conditions["old_pod"]
+    new_conditions = known_conditions["replacement_pod"]
+    differences = [
+        key for key in CONDITION_KEYS
+        if (
+            type(old_conditions[key]) is not type(new_conditions[key])
+            or old_conditions[key] != new_conditions[key]
+        )
+    ]
+    if differences:
+        return (
+            False,
+            "Measurement conditions differ between old and replacement Pods: "
+            + ", ".join(differences),
+        )
+
+    return True, "All required measurement conditions are known and identical."
 
 
 def pod_logs(name):
@@ -104,6 +298,11 @@ def main():
         "job_id": job_id,
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "status": "started",
+        "measurement_conditions_observations": {},
+        "measurement_conditions_comparable": False,
+        "measurement_conditions_reason": (
+            "Replacement Pod measurement conditions have not been collected."
+        ),
     }
 
     output_path = OUTPUT / f"{job_id}.json"
@@ -141,6 +340,8 @@ def main():
 
         old_pod = names[0]
         data["old_pod"] = old_pod
+        old_conditions = collect_pod_measurement_conditions(old_pod)
+        data["measurement_conditions_observations"]["old_pod"] = old_conditions
         print(f"OLD_POD={old_pod}", flush=True)
 
         added = kubectl(
@@ -213,6 +414,17 @@ def main():
             POD_TIMEOUT,
             "replacement Pod Ready",
         )
+
+        new_conditions = collect_pod_measurement_conditions(new_pod)
+        data["measurement_conditions_observations"][
+            "replacement_pod"
+        ] = new_conditions
+        (
+            data["measurement_conditions_comparable"],
+            data["measurement_conditions_reason"],
+        ) = compare_measurement_conditions(old_conditions, new_conditions)
+        if data["measurement_conditions_comparable"]:
+            data["measurement_conditions"] = old_conditions["conditions"]
 
         # T3: processing completion first observed in logs.
         processed_marker = f"Processed: job_id={job_id},"

@@ -14,6 +14,147 @@ METRICS = {
     "job_recovered_observed": "Job recovery observed",
     "ready_to_recovery": "Ready to recovery",
 }
+CONDITION_KEYS = (
+    "failure_scenario",
+    "measurement_method",
+    "test_pause_seconds",
+    "job_recovery_includes_test_pause",
+    "worker_readiness_probe",
+)
+
+
+def summarize_measurement_conditions(records):
+    unavailable = []
+    known_conditions = []
+
+    for record in records:
+        job_id = record.get("job_id", "unknown")
+        conditions = record.get("measurement_conditions")
+        comparable = record.get("measurement_conditions_comparable")
+        reason = record.get("measurement_conditions_reason")
+        if comparable is not True:
+            unavailable.append(
+                f"{job_id}: measurement conditions are not verified comparable"
+                + (f" ({reason})" if isinstance(reason, str) and reason else "")
+            )
+            continue
+
+        if not isinstance(conditions, dict):
+            unavailable.append(f"{job_id}: measurement_conditions is missing")
+            continue
+
+        observations = record.get("measurement_conditions_observations")
+        if not isinstance(observations, dict):
+            unavailable.append(
+                f"{job_id}: per-Pod measurement condition observations are missing"
+            )
+            continue
+
+        record_known = True
+        for pod_key in ("old_pod", "replacement_pod"):
+            observation = observations.get(pod_key)
+            pod_conditions = (
+                observation.get("conditions")
+                if isinstance(observation, dict)
+                else None
+            )
+            if not isinstance(pod_conditions, dict):
+                unavailable.append(
+                    f"{job_id}/{pod_key}: measurement conditions are missing"
+                )
+                record_known = False
+            elif any(
+                type(pod_conditions.get(key)) is not type(conditions.get(key))
+                or pod_conditions.get(key) != conditions.get(key)
+                for key in CONDITION_KEYS
+            ):
+                unavailable.append(
+                    f"{job_id}/{pod_key}: conditions do not match the "
+                    "verified common measurement_conditions"
+                )
+                record_known = False
+
+        for key in CONDITION_KEYS:
+            value = conditions.get(key)
+            if key in ("failure_scenario", "measurement_method"):
+                valid = isinstance(value, str) and bool(value.strip())
+            elif key == "test_pause_seconds":
+                try:
+                    valid = (
+                        not isinstance(value, bool)
+                        and isinstance(value, (int, float))
+                        and math.isfinite(float(value))
+                        and value >= 0
+                    )
+                except OverflowError:
+                    valid = False
+            else:
+                valid = isinstance(value, bool)
+            if not valid:
+                unavailable.append(
+                    f"{job_id}/{key}: condition is missing or invalid"
+                )
+                record_known = False
+
+        extra_keys = set(conditions) - set(CONDITION_KEYS)
+        missing_keys = set(CONDITION_KEYS) - set(conditions)
+        if extra_keys or missing_keys:
+            unavailable.append(
+                f"{job_id}: condition keys differ "
+                f"(missing={sorted(missing_keys)}, extra={sorted(extra_keys)})"
+            )
+            record_known = False
+
+        if record_known:
+            known_conditions.append((job_id, conditions))
+
+    if unavailable:
+        reason = "Measurement conditions are unknown or incomplete: " + "; ".join(
+            unavailable
+        )
+        return {
+            "measurement_conditions_comparable": False,
+            "measurement_conditions_reason": reason,
+        }
+
+    if not known_conditions:
+        return {
+            "measurement_conditions_comparable": False,
+            "measurement_conditions_reason": (
+                "No measurement conditions are available."
+            ),
+        }
+
+    reference_job, reference = known_conditions[0]
+    mismatches = []
+    for job_id, conditions in known_conditions[1:]:
+        for key in CONDITION_KEYS:
+            if conditions[key] != reference[key]:
+                mismatches.append(
+                    f"{key} differs between {reference_job} "
+                    f"({reference[key]!r}) and {job_id} ({conditions[key]!r})"
+                )
+
+    if mismatches:
+        return {
+            "measurement_conditions_comparable": False,
+            "measurement_conditions_reason": (
+                "Measurement conditions differ across runs: "
+                + "; ".join(mismatches)
+            ),
+        }
+
+    return {
+        "measurement_conditions_comparable": True,
+        "measurement_conditions_reason": (
+            f"All {len(known_conditions)} runs have identical, known "
+            "measurement conditions."
+        ),
+        "measurement_conditions": {
+            key: reference[key]
+            for key in CONDITION_KEYS
+        },
+    }
 
 
 def load_records(input_dir: Path):
@@ -65,6 +206,7 @@ def summarize(records):
         "passed_runs": len(passed),
         "failed_runs": len(records) - len(passed),
         "metrics": {},
+        **summarize_measurement_conditions(records),
     }
 
     for key in METRICS:
@@ -129,6 +271,10 @@ def write_markdown(summary, output_path: Path):
         f"- Total runs: {summary['total_runs']}",
         f"- Passed: {summary['passed_runs']}",
         f"- Failed: {summary['failed_runs']}",
+        f"- Measurement conditions comparable: "
+        f"{summary['measurement_conditions_comparable']}",
+        f"- Measurement conditions: "
+        f"{summary['measurement_conditions_reason']}",
         "",
         "## Recovery time statistics",
         "",
