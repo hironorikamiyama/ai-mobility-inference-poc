@@ -1,0 +1,29 @@
+{
+  "description": "Illustrative PoC thresholds only; these are not production SLOs.",
+  "minimum_samples": 3,
+  "measurement_conditions": {
+    "failure_scenario": "worker_pod_deletion",
+    "measurement_method": "kubectl_polling_observation",
+    "test_pause_seconds": 30,
+    "job_recovery_includes_test_pause": true,
+    "worker_readiness_probe": false
+  },
+  "metrics": {
+    "pod_recreated_observed": {
+      "threshold_seconds": 10,
+      "required": true
+    },
+    "pod_ready_observed": {
+      "threshold_seconds": 15,
+      "required": true
+    },
+    "job_recovered_observed": {
+      "threshold_seconds": 45,
+      "required": true
+    },
+    "ready_to_recovery": {
+      "threshold_seconds": 35,
+      "required": false
+    }
+  }
+}

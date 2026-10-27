@@ -2498,3 +2498,20 @@ Phase 18の測定データを自動集計し、JSON・CSV・Markdownの3形式�
 
 これにより、障害復旧試験の実行から測定結果の保存、統計集計、レポート生成までをPythonで処理できる基盤を構築した。
 ```
+
+---
+
+## Phase 20：復旧時間のSLO評価
+
+Phase 19の `summary.json` を入力として、復旧時間の平均値を例示閾値と比較する。判定は `PASS`、`FAIL`、`INCONCLUSIVE` の3種類で、必須指標に比較可能な `FAIL` が1つでもあれば総合判定を `FAIL` とする。
+
+```bash
+python scripts/phase20-slo-evaluation.py \
+  --input output/phase19/summary.json \
+  --config config/phase20-slo.json \
+  --output output/phase20
+```
+
+JSONとMarkdownの評価結果を `output/phase20/` に作成する。Phase 18/19の測定値や既存レポートは変更しない。
+
+設定ファイルの閾値はPoCの例示値であり、正式な本番SLOではない。Phase 18の測定JSONとPhase 19の集計JSONには測定条件が記録されていないため、そのまま評価すると `INCONCLUSIVE` になる。測定データ側に設定と一致する測定条件が明示され、比較対象の平均値と最低サンプル数も満たされた場合のみ、閾値との比較を行う。Phase 18のジョブ復旧測定にはテスト用30秒待機が含まれ、ポーリング観測値およびアプリケーション固有Readiness Probeがない点も評価条件に含める。
