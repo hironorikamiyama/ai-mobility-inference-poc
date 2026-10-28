@@ -1194,6 +1194,7 @@ git diff --stat
 | 19 | Kubernetes障害復旧時間の統計集計・CSV/Markdownレポート自動生成・入力値検証・pytest15件 | 完了 |
 | 20 | 測定条件に基づく復旧時間のPoC閾値評価 | 完了 |
 | 21 | 旧Pod・代替Podの測定条件記録・一致確認・Phase 20連携の実クラスタ検証（3件） | 完了 |
+| 22 | Phase 18〜20のオフライン既定オーケストレーション・クラスタ実行ガード・失敗状態記録・実クラスタ正常系/安全停止検証 | 完了 |
 ---
 
 # 19. まとめ
@@ -2571,3 +2572,71 @@ python scripts/phase20-slo-evaluation.py \
 - 時刻はKubernetesイベントの実発生時刻ではなく、`kubectl`によるポーリングで状態を観測した値である。
 - 測定は3件のため、p95などの高パーセンタイル評価には十分でない。
 - 既存のPhase 18〜20の説明・記録を維持し、今回のPhase 21記載はこれらに追記した。
+
+---
+
+## Phase 22：障害復旧評価オーケストレーター
+
+Phase 18の測定JSONをPhase 19で集計し、Phase 20で評価する一連の処理を単一CLIから実行する。デフォルトはオフラインモードで、Kubernetesへの接続や測定・障害注入は行わない。
+
+### オフライン実行
+
+```bash
+python scripts/phase22-recovery-orchestrator.py \
+  --mode offline \
+  --input output/phase18 \
+  --output output/phase22
+```
+
+Phase 19のJSON/CSV/MarkdownとPhase 20のJSON/Markdownを指定先に出力し、実行結果を`phase22-result.json`に記録する。出力先は新規ディレクトリである必要があり、既存の出力先は上書きせず中止する。入力の測定JSONや既存Phase 19/20レポートは変更しない。測定条件が不明なデータは`INCONCLUSIVE`のまま引き継ぐ。
+
+### クラスタ検証モード
+
+クラスタモードは明示的な確認と対象context/namespaceの指定が必要で、1回のコマンドで最大10測定まで実行できる。実行前および各測定前にcontext・namespace、通常Workerが停止していること、検証用Workerが1レプリカでReadyであること、Redis Pendingが0件であることを読み取り確認する。通常Workerを停止したり、検証用Workerを起動したりする操作は行わない。測定はPhase 18の処理を呼び出すため、検証用Worker Podの削除を伴う。
+
+```bash
+python scripts/phase22-recovery-orchestrator.py \
+  --mode cluster \
+  --expected-context kind-go-k8s-poc \
+  --namespace ai-mobility-poc \
+  --confirm-cluster-run \
+  --runs 1 \
+  --output output/phase22-cluster
+```
+
+クラスタモードでは実行前および各測定前にcontext・namespace、通常Workerが停止していること、検証用Workerが1レプリカでReadyであること、Redis Pendingが0件であることを読み取り確認する。context/namespaceやWorker状態が期待値と異なる場合は中止する。通常Worker Podの確認対象は`app=inference-worker`ラベルに一致するPodに限られる。ラベルなし、または異なるラベルの通常Worker Podが存在しないことまでは保証しない。
+
+途中で測定・集計に失敗した場合は成功扱いにせず、可能な範囲の測定結果と失敗理由を`phase22-result.json`に保存する。測定失敗後は通常Worker Deployment/Pod、検証用Worker Deployment/Pod、Redis Pending件数を読み取り、取得値と個別の取得エラーを記録する。状態取得に失敗しても元の実行失敗理由は維持する。自動的なscale変更、Pod削除、Pending削除、Worker再起動は行わない。
+
+途中失敗前に成功測定がある場合、Phase 20はその成功分で評価されることがある。Phase 20の判定ロジックとレポート上の判定値は変更せず、Phase 22 JSONでは`partial_evaluation: true`を記録し、Phase 20 Markdownにも部分評価の注記を追加する。この場合もPhase 22全体の状態は`ERROR`であり、Phase 20の`PASS`を全測定成功と解釈してはならない。評価結果が`PASS`のときだけ終了コード0、`FAIL`・`INCONCLUSIVE`・実行エラーでは非0を返す。
+
+入力・出力パスの重複判定ではsymlinkを解決した後のパス包含関係を検査する。ただし、共有環境で別プロセスが検査後にパスやsymlinkを変更する競合（TOCTOU）までは防止しない。共有出力先を並行して変更するプロセスがない状態で実行すること。
+
+### 実クラスタ検証結果
+
+以下はcontext `kind-go-k8s-poc`、namespace `ai-mobility-poc`で実施した実クラスタ検証である。通常系の1回の測定では、Phase 18測定が成功し、Phase 21の測定条件比較も可能だった。一方、Phase 20は最低サンプル数3件に対して1件だったため`INCONCLUSIVE`となった。これは測定失敗を示すものではなく、閾値を判定するためのサンプル数が不足したことを示す。
+
+| 項目 | 結果 |
+| --- | ---: |
+| 測定成功 | 1/1 |
+| 測定条件比較可能 | true |
+| Pod再作成検出 | 8.344秒 |
+| Pod Ready検出 | 8.712秒 |
+| ジョブ復旧完了検出 | 38.451秒 |
+| Ready後の処理完了 | 29.740秒 |
+| Phase 22総合結果 | INCONCLUSIVE |
+| 判定理由 | 最低サンプル数3件に対し、測定は1件 |
+
+安全性確認では、検証用Workerが0レプリカの状態でクラスタモードを実行した。事前チェックが状態不一致を検出して処理を中止したため、障害注入は実施されなかった。Phase 22結果JSONには`ERROR`、測定件数0件、Worker状態、Redis Pending 0件、失敗理由が記録された。
+
+検証終了後は通常Workerを1/1、検証用Workerを0/0へ戻し、通常Workerのロールアウト成功を確認した。Phase 22はWorkerやDeploymentを自動的に切り戻さないため、実クラスタ検証後の環境復旧は運用者が確認して行う。
+
+### 制約・解釈
+
+- ジョブ復旧完了とReady後の処理完了時間には、テスト用の30秒待機が含まれる。
+- Phase 20の閾値はPoC用の例示値であり、実運用のSLOではない。
+- 今回の`INCONCLUSIVE`は測定失敗ではなく、最低サンプル数に達しなかったことによる評価保留である。
+- 時刻はKubernetesイベントの実発生時刻ではなく、`kubectl`によるポーリングで状態を観測した値である。
+- 通常Worker Podの安全確認は`app=inference-worker`ラベルの検索に基づく。ラベルなし・別ラベルのWorker Podまでは検出を保証しない。
+- パス衝突チェックは解決後の入力・出力パスの包含関係を確認するが、共有環境で検査後にパスやsymlinkを変更するTOCTOU競合までは防止しない。
+- クラスタモードは検証用Worker Podを削除する障害注入を伴う。対象環境、context、namespace、Worker状態を確認し、明示確認オプションを指定して実行すること。

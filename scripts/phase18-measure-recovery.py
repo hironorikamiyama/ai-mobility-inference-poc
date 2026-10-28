@@ -14,6 +14,7 @@ APP = "phase17-worker"
 STREAM = "inference_jobs"
 GROUP = "inference_workers"
 OUTPUT = Path("output/phase18")
+KUBECTL_CONTEXT = None
 
 POLL_INTERVAL = 0.2
 CHECKPOINT_TIMEOUT = 25
@@ -40,7 +41,19 @@ def run(*args, check=True):
 
 
 def kubectl(*args, check=True):
-    return run("kubectl", "-n", NS, *args, check=check)
+    context_args = (
+        ("--context", KUBECTL_CONTEXT)
+        if KUBECTL_CONTEXT
+        else ()
+    )
+    return run(
+        "kubectl",
+        *context_args,
+        "-n",
+        NS,
+        *args,
+        check=check,
+    )
 
 
 def pod_names():
