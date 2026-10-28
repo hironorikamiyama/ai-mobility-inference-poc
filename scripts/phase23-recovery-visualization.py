@@ -375,6 +375,10 @@ def render_html(analysis):
         if isinstance(phase22, dict)
         else "Unavailable"
     )
+    partial_evaluation = (
+        isinstance(phase22, dict)
+        and phase22.get("partial_evaluation") is True
+    )
     order_note = (
         "Measurements are ordered by recorded timestamp."
         if analysis["ordering"] == "timestamp"
@@ -473,6 +477,7 @@ table{{border-collapse:collapse;width:100%}} th,td{{text-align:left;padding:.3re
 Successful: {analysis['successful_count']} | Failed: {analysis['failed_count']}</p>
 <p>Phase 22 status: <strong>{html.escape(str(phase22_status))}</strong> |
 Phase 20 evaluation: <strong>{html.escape(str(overall_status))}</strong></p>
+{"<p class=\"warning\"><strong>Partial evaluation:</strong> Phase 20 results use only successful measurements collected before execution failed. The overall Phase 22 result is not a full successful run.</p>" if partial_evaluation else ""}
 <p>{html.escape(order_note)}</p>
 <p>Statistics source: {html.escape(str(analysis['statistics_source']))}</p>
 </section>
@@ -499,14 +504,23 @@ def path_overlaps(first, second):
     return first == second or first in second.parents or second in first.parents
 
 
-def generate(input_dir, output_dir, measurement_dir=None):
+def generate(
+    input_dir,
+    output_dir,
+    measurement_dir=None,
+    *,
+    allow_output_inside_input=False,
+):
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(
             f"Output directory already exists: {output_dir}"
         )
     input_dir = input_dir.resolve()
     output_resolved = output_dir.resolve()
-    if path_overlaps(input_dir, output_resolved):
+    output_is_inside_input = input_dir.resolve() in output_resolved.parents
+    if path_overlaps(input_dir, output_resolved) and not (
+        allow_output_inside_input and output_is_inside_input
+    ):
         raise ValueError("Input and output directories must not overlap.")
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Phase 22 input directory does not exist: {input_dir}")
@@ -523,8 +537,7 @@ def generate(input_dir, output_dir, measurement_dir=None):
             f"Phase 18 measurement directory does not exist: {measurement_dir}"
         )
     if measurement_dir != input_dir / "phase18" and path_overlaps(
-        measurement_dir,
-        output_resolved,
+        measurement_dir, output_resolved
     ):
         raise ValueError(
             "Phase 18 input and output directories must not overlap."

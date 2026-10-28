@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PHASE18_PATH = ROOT / "scripts" / "phase18-measure-recovery.py"
 PHASE19_PATH = ROOT / "scripts" / "phase19-recovery-report.py"
 PHASE20_PATH = ROOT / "scripts" / "phase20-slo-evaluation.py"
+PHASE23_PATH = ROOT / "scripts" / "phase23-recovery-visualization.py"
 DEFAULT_INPUT = Path("output/phase18")
 DEFAULT_CONFIG = ROOT / "config" / "phase20-slo.json"
 DEFAULT_OUTPUT = Path("output/phase22")
@@ -37,6 +38,10 @@ def load_phase_modules():
         load_module("phase22_phase19", PHASE19_PATH),
         load_module("phase22_phase20", PHASE20_PATH),
     )
+
+
+def load_phase23_module():
+    return load_module("phase22_phase23", PHASE23_PATH)
 
 
 def write_json(path, value, *, create=False):
@@ -613,6 +618,11 @@ def build_parser():
         action="store_true",
         help="Confirm that cluster mode may inject a worker Pod failure",
     )
+    parser.add_argument(
+        "--include-visualization",
+        action="store_true",
+        help="Also generate Phase 23 HTML/SVG and JSON reports",
+    )
     return parser
 
 
@@ -647,6 +657,24 @@ def status_exit_code(status):
     if status == "INCONCLUSIVE":
         return 2
     return 3
+
+
+def generated_artifacts(output_dir):
+    candidates = (
+        "phase18",
+        "phase19/summary.json",
+        "phase19/recovery-results.csv",
+        "phase19/recovery-report.md",
+        "phase20/slo-evaluation.json",
+        "phase20/slo-evaluation.md",
+        "phase23/recovery-analysis.html",
+        "phase23/recovery-analysis.json",
+    )
+    return [
+        path
+        for path in candidates
+        if (output_dir / path).exists()
+    ]
 
 
 def main(argv=None):
@@ -713,9 +741,41 @@ def main(argv=None):
             "status": "ERROR",
             "execution_error": str(exc),
         })
-    finally:
-        result["completed_at"] = datetime.now(timezone.utc).isoformat()
-        write_json(result_path, result)
+    if args.include_visualization:
+        if args.mode == "offline" and result.get("status") in (
+            "PASS",
+            "FAIL",
+            "INCONCLUSIVE",
+        ):
+            result["evaluation_status"] = result["status"]
+        try:
+            write_json(result_path, result)
+            phase23 = load_phase23_module()
+            phase23.generate(
+                output_dir,
+                output_dir / "phase23",
+                args.input if args.mode == "offline" else None,
+                allow_output_inside_input=True,
+            )
+            result["visualization"] = {
+                "status": "generated",
+                "html": "phase23/recovery-analysis.html",
+                "analysis_json": "phase23/recovery-analysis.json",
+            }
+        except Exception as exc:
+            result["visualization"] = {
+                "status": "failed",
+                "error": str(exc),
+            }
+            result["visualization_error"] = str(exc)
+            if result.get("status") != "ERROR":
+                result["execution_error"] = (
+                    f"Phase 23 visualization failed: {exc}"
+                )
+            result["status"] = "ERROR"
+        result["generated_artifacts"] = generated_artifacts(output_dir)
+    result["completed_at"] = datetime.now(timezone.utc).isoformat()
+    write_json(result_path, result)
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
     print(f"Result: {result_path}")

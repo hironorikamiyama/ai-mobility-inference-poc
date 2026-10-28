@@ -433,6 +433,57 @@ def test_phase18_only_comparable_conditions_are_not_discarded(tmp_path):
     assert analysis["measurement_conditions"]["comparable"] is True
 
 
+def test_phase22_subdirectory_output_can_be_created_only_when_enabled(
+    tmp_path,
+):
+    input_dir = tmp_path / "phase22"
+    output_dir = input_dir / "phase23"
+    input_dir.mkdir()
+    write_json(input_dir / "phase22-result.json", {"status": "PASS"})
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        visualization.generate(input_dir, output_dir)
+
+    visualization.generate(
+        input_dir,
+        output_dir,
+        allow_output_inside_input=True,
+    )
+
+    assert (output_dir / visualization.HTML_NAME).is_file()
+
+
+def test_partial_phase22_result_is_explained_in_html():
+    analysis = {
+        "measurement_count": 1,
+        "successful_count": 1,
+        "failed_count": 0,
+        "ordering": "unknown",
+        "measurements": [],
+        "statistics": visualization.calculate_statistics([]),
+        "statistics_source": "phase19",
+        "measurement_conditions": {
+            "comparable": False,
+            "conditions": None,
+            "reason": "conditions unknown",
+        },
+        "slo_evaluation": {
+            "overall_status": "PASS",
+            "metrics": {},
+        },
+        "phase22_result": {
+            "status": "ERROR",
+            "partial_evaluation": True,
+        },
+        "limitations": [],
+    }
+
+    html_text = visualization.render_html(analysis)
+
+    assert "Partial evaluation" in html_text
+    assert "not a full successful run" in html_text
+
+
 def test_html_is_self_contained_without_external_assets(tmp_path):
     input_dir = tmp_path / "phase22"
     output_dir = tmp_path / "analysis"

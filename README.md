@@ -1196,6 +1196,7 @@ git diff --stat
 | 21 | 旧Pod・代替Podの測定条件記録・一致確認・Phase 20連携の実クラスタ検証（3件） | 完了 |
 | 22 | Phase 18〜20のオフライン既定オーケストレーション・クラスタ実行ガード・失敗状態記録・実クラスタ正常系/安全停止検証 | 完了 |
 | 23 | Phase 18〜22成果物の復旧時間可視化・静的HTML/JSON分析レポート | 完了 |
+| 24 | Phase 22へのPhase 23可視化統合・単一CLIレポート生成 | 完了 |
 ---
 
 # 19. まとめ
@@ -2679,3 +2680,62 @@ python scripts/phase23-recovery-visualization.py \
 - 復旧時間には記録された条件に応じてテスト用30秒待機が含まれる。待機時間を差し引いて実運用時間として表示することはしない。
 - Phase 20の閾値はPoC用の例示値であり、実運用SLOではない。3件程度のサンプルはp95などの高パーセンタイルやSLO保証には不十分である。
 - JSON由来の文字列はHTML出力時にエスケープする。Phase 23は既存Phase 18〜22の測定・レポートを変更しない。
+
+---
+
+## Phase 24：統合復旧評価レポート
+
+Phase 22の既存CLIに`--include-visualization`を追加し、このオプションを指定した場合に限りPhase 23を実行する。オプションを指定しない場合のPhase 22動作と既存出力は変更しない。オフラインではPhase 18入力ディレクトリ、クラスタモードでは生成されたPhase 18測定JSONをPhase 23へ渡し、Phase 19統計・Phase 20判定・Phase 23 HTML/SVG・分析JSONをまとめて生成する。
+
+### 実行例
+
+オフライン実行：
+
+```bash
+python scripts/phase22-recovery-orchestrator.py \
+  --mode offline \
+  --input output/phase18 \
+  --output output/phase24 \
+  --include-visualization
+```
+
+クラスタ実行では、従来どおり確認フラグ、context、namespaceが必須である。クラスタ操作は明示的に指定した場合に限り発生する：
+
+```bash
+python scripts/phase22-recovery-orchestrator.py \
+  --mode cluster \
+  --expected-context kind-go-k8s-poc \
+  --namespace ai-mobility-poc \
+  --confirm-cluster-run \
+  --runs 1 \
+  --output output/phase24-cluster \
+  --include-visualization
+```
+
+### 出力構造
+
+```text
+output/phase24/
+  phase19/
+    summary.json
+    recovery-results.csv
+    recovery-report.md
+  phase20/
+    slo-evaluation.json
+    slo-evaluation.md
+  phase23/
+    recovery-analysis.html
+    recovery-analysis.json
+  phase22-result.json
+```
+
+クラスタモードではさらに`phase18/phase18-*.json`が作成される。オフラインモードのPhase 18入力JSONは外部ディレクトリから読み込み、複製・変更しない。Phase 22結果JSONには可視化状態、HTML/JSONの相対パス、生成済み成果物を記録する。Phase 23で失敗した場合はエラー理由とそれまでに生成された成果物を記録し、Phase 20がPASSでも統合結果をERRORとする。途中失敗で部分評価がある場合はPhase 23 HTMLにもその旨を示す。測定件数不足によるINCONCLUSIVEはそのまま維持する。
+
+### 安全性・制約
+
+- `--include-visualization`は任意で、既定では無効。統計計算とSLO判定はPhase 19/20の既存実装を使用し、独自の判定を追加しない。
+- 出力先はPhase 22が新規作成し、既存出力先への再実行を拒否する。Phase 23成果物はその新規出力先の`phase23/`に作成し、Phase 22結果JSONや他レポートとの上書き衝突を避ける。
+- Phase 23の単体CLIにある出力先重複保護は維持し、Phase 22統合からの呼び出しのみ、Phase 22出力ルート内に未作成の`phase23/`サブディレクトリを生成できる。
+- 既存のクラスタ事前確認と最大1〜10回の測定制限を維持する。Phase 22/23は自動でWorkerをscale、再起動、削除して復旧させない。クラスタ測定時には既存仕様どおり検証用Worker Pod削除が発生するため、明示確認なしでは実施されない。
+- Phase 20の閾値はPoC用の例示値であり、実運用SLOではない。測定にはテスト用30秒待機が含まれる場合があり、少数サンプルによる評価をSLO保証として扱わない。
+- Phase 23は測定日時・測定条件を推測しない。HTMLはローカルSVGを使用し、外部CDNに依存しない。入力由来文字列のHTMLエスケープを維持する。

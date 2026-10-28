@@ -110,6 +110,7 @@ def test_offline_mode_runs_phase19_and_phase20(tmp_path):
     )["overall_status"] == "PASS"
     assert (output_dir / "phase19/recovery-results.csv").is_file()
     assert (output_dir / "phase19/recovery-report.md").is_file()
+    assert not (output_dir / "phase23").exists()
 
 
 @pytest.mark.parametrize(
@@ -646,3 +647,181 @@ def test_cluster_failure_records_individual_state_read_errors():
         "normal_worker_deployment": "normal deployment unavailable",
         "verification_worker_pods": "verification Pod unavailable",
     }
+
+
+@pytest.mark.parametrize(
+    ("value", "include_conditions", "expected_status"),
+    [
+        (1, True, "PASS"),
+        (100, True, "FAIL"),
+        (1, False, "INCONCLUSIVE"),
+    ],
+)
+def test_offline_visualization_bundle_preserves_phase20_status(
+    tmp_path,
+    value,
+    include_conditions,
+    expected_status,
+):
+    input_dir = tmp_path / "measurements"
+    output_dir = tmp_path / "integrated-output"
+    write_measurements(
+        input_dir,
+        value=value,
+        include_conditions=include_conditions,
+    )
+
+    exit_code = orchestrator.main([
+        "--mode",
+        "offline",
+        "--input",
+        str(input_dir),
+        "--output",
+        str(output_dir),
+        "--config",
+        str(CONFIG),
+        "--include-visualization",
+    ])
+
+    result = json.loads(
+        (output_dir / orchestrator.RESULT_NAME).read_text(encoding="utf-8")
+    )
+    assert result["status"] == expected_status
+    assert result["visualization"]["status"] == "generated"
+    assert result["visualization"]["html"] == (
+        "phase23/recovery-analysis.html"
+    )
+    assert (output_dir / "phase19/summary.json").is_file()
+    assert (output_dir / "phase20/slo-evaluation.json").is_file()
+    assert (output_dir / "phase23/recovery-analysis.html").is_file()
+    assert (output_dir / "phase23/recovery-analysis.json").is_file()
+    assert "phase23/recovery-analysis.html" in result["generated_artifacts"]
+    assert exit_code == orchestrator.status_exit_code(expected_status)
+
+
+def test_visualization_failure_changes_overall_pass_to_error(
+    tmp_path,
+    monkeypatch,
+):
+    input_dir = tmp_path / "measurements"
+    output_dir = tmp_path / "integrated-output"
+    write_measurements(input_dir)
+
+    class FailedVisualization:
+        @staticmethod
+        def generate(*args, **kwargs):
+            raise RuntimeError("simulated renderer failure")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "load_phase23_module",
+        lambda: FailedVisualization,
+    )
+    exit_code = orchestrator.main([
+        "--input",
+        str(input_dir),
+        "--output",
+        str(output_dir),
+        "--config",
+        str(CONFIG),
+        "--include-visualization",
+    ])
+
+    result = json.loads(
+        (output_dir / orchestrator.RESULT_NAME).read_text(encoding="utf-8")
+    )
+    assert exit_code == 3
+    assert result["status"] == "ERROR"
+    assert result["evaluation_status"] == "PASS"
+    assert result["visualization"]["status"] == "failed"
+    assert result["visualization_error"] == "simulated renderer failure"
+    assert "phase19/summary.json" in result["generated_artifacts"]
+    assert "phase20/slo-evaluation.json" in result["generated_artifacts"]
+
+
+def test_cluster_partial_failure_visualization_is_marked_partial(
+    tmp_path,
+    monkeypatch,
+):
+    output_dir = tmp_path / "cluster-output"
+    calls = 0
+
+    def preflight(context, namespace):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated preflight stop")
+        return {"context": context, "namespace": namespace}
+
+    def measured(phase18_module, context, namespace, measurements_dir):
+        measurements_dir.mkdir(parents=True, exist_ok=True)
+        path = measurements_dir / "phase18-job-1.json"
+        path.write_text(json.dumps(record("job-1")), encoding="utf-8")
+        return {
+            "record": record("job-1"),
+            "path": str(path),
+            "error": None,
+            "stdout": "",
+        }
+
+    monkeypatch.setattr(orchestrator, "check_cluster_target", preflight)
+    monkeypatch.setattr(orchestrator, "run_phase18_measurement", measured)
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_cluster_state",
+        lambda context, namespace: ({"redis_pending_count": 0}, {}),
+    )
+    exit_code = orchestrator.main([
+        "--mode",
+        "cluster",
+        "--expected-context",
+        "kind-poc",
+        "--namespace",
+        "ai-mobility-poc",
+        "--confirm-cluster-run",
+        "--runs",
+        "2",
+        "--output",
+        str(output_dir),
+        "--config",
+        str(CONFIG),
+        "--include-visualization",
+    ])
+
+    result = json.loads(
+        (output_dir / orchestrator.RESULT_NAME).read_text(encoding="utf-8")
+    )
+    html_text = (
+        output_dir / "phase23/recovery-analysis.html"
+    ).read_text(encoding="utf-8")
+    assert exit_code == 3
+    assert result["status"] == "ERROR"
+    assert result["partial_evaluation"] is True
+    assert result["visualization"]["status"] == "generated"
+    assert "Partial evaluation" in html_text
+    assert "not a full successful run" in html_text
+
+
+def test_include_visualization_is_rejected_if_output_already_exists(
+    tmp_path,
+):
+    input_dir = tmp_path / "measurements"
+    output_dir = tmp_path / "existing-output"
+    write_measurements(input_dir)
+    output_dir.mkdir()
+    sentinel = output_dir / "keep.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+
+    exit_code = orchestrator.main([
+        "--input",
+        str(input_dir),
+        "--output",
+        str(output_dir),
+        "--config",
+        str(CONFIG),
+        "--include-visualization",
+    ])
+
+    assert exit_code == 3
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert not (output_dir / "phase23").exists()
